@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 )
 import pygame
 import tempfile
+import subprocess
 
 
 from app.settings import Settings
@@ -414,7 +415,7 @@ class SummaryTab(QWidget):
             5. **Temas Recurrentes**: Patrones o temas que aparecen múltiples veces
             6. **Descarta Notas Irrelevantes**: Omite notas que no estan en funcion de proyecto eventos problemas o funciones principales
             
-            Mantén un tono profesional pero cercano. El resumen debe ser útil para revisar rápidamente los últimos días."""
+            Mantén un tono profesional util para ul tts de macos nativo evita caracteres o simbolos que provoquen problemas de transcripcion. El resumen debe ser útil para revisar rápidamente los últimos días."""
             
             user_prompt = f"Analiza y resume las siguientes notas de los últimos 3 días:\n\n{combined_content}"
             
@@ -459,52 +460,111 @@ class SummaryTab(QWidget):
             print(f"Error preparando audio: {e}")
     
     def _do_generate_audio(self, text: str):
-        """Genera el audio real usando OpenAI TTS"""
+        """Genera audio usando TTS nativo de macOS con Francisca"""
+        import subprocess
+        import sys
+        
         try:
-            # Verificar que no se haya cancelado
             if not hasattr(self, '_audio_generation_active'):
                 self._audio_generation_active = True
-            
+
             if not self._audio_generation_active:
                 return
-            
-            # Generar audio con OpenAI TTS
-            response = self.ai.client.audio.speech.create(
-                model="tts-1",
-                voice="alloy",
-                input=text,
-                speed=1.0
-            )
-            
-            # Verificar nuevamente antes de procesar
-            if not self._audio_generation_active:
+
+            if sys.platform != "darwin":
+                self._show_simple_error("TTS solo disponible en macOS")
                 return
-            
-            # Guardar audio temporal
+
+            # Limpiar archivo temporal anterior
             if hasattr(self, 'audio_file') and self.audio_file:
                 try:
                     os.remove(self.audio_file)
                 except:
                     pass
+
+            # CAMBIO: Usar .wav en lugar de .aiff
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
+                temp_path = temp_file.name
+
+            # Limitar longitud del texto
+            clean_text = text[:4000] + "..." if len(text) > 4000 else text
+
+            # CAMBIO: Agregar --data-format para generar WAV compatible
+            cmd = [
+                "say",
+                "-v", "Francisca",
+                "-r", "160",
+                "--data-format=LEI16@22050",  # WAV 16-bit a 22kHz
+                "-o", temp_path,
+                clean_text
+            ]
             
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as f:
-                f.write(response.content)
-                self.audio_file = f.name
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             
-            if self._audio_generation_active:
-                self._hide_progress()
-                self.btn_play_audio.setEnabled(True)
-                self.btn_play_audio.setText("🔊 Reproducir Audio")
-                self._show_success_message()
-            
+            if result.returncode == 0:
+                if self._audio_generation_active:
+                    self.audio_file = temp_path
+                    self._hide_progress()
+                    self.btn_play_audio.setEnabled(True)
+                    self.btn_play_audio.setText("🔊 Reproducir Audio")
+                    self._show_success_message()
+                    QTimer.singleShot(500, self._auto_play_audio)
+            else:
+                raise Exception(f"Error en comando say: {result.stderr}")
+
+        except subprocess.TimeoutExpired:
+            self._show_simple_error("Timeout generando audio")
+        except FileNotFoundError:
+            self._show_simple_error("Comando 'say' no disponible")
         except Exception as e:
-            if hasattr(self, '_audio_generation_active') and self._audio_generation_active:
-                self._hide_progress()
-                print(f"Error generando audio: {e}")
-                QMessageBox.warning(self, "Audio no disponible", 
-                                f"No se pudo generar el audio: {str(e)}")
-        finally:
-            self._audio_generation_active = False
+            self._show_simple_error(f"Error de TTS: {str(e)}")
+            if 'temp_path' in locals():
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
+    def _auto_play_audio(self):
+        """Reproduce audio automáticamente después de generarlo"""
+        if self.audio_file and os.path.exists(self.audio_file) and not self.audio_playing:
+            self._play_audio()            
+    def _show_simple_error(self, message: str):
+        """Muestra error simple"""
+        self._hide_progress()
+        QMessageBox.warning(self, "Error de audio", message)
+    def _get_chilean_voice_instructions(self) -> str:
+        """Devuelve instrucciones específicas para tono chileno"""
+        return (
+            "Habla con un tono conversacional y cercano, característico del español chileno. "
+            "Mantén una velocidad moderada, pronunciación clara y natural. "
+            "Usa un registro informal pero profesional, como si fueras un asistente amigable. "
+            "Haz pausas naturales entre oraciones y enfatiza suavemente los puntos importantes."
+        )
+
+    def _show_error_message(self, error: str):
+        """Muestra mensaje de error específico y útil"""
+        self._hide_progress()
+        
+        # Detectar tipos de error y dar mensajes claros
+        error_str = str(error).lower()
+        
+        if "rate limit" in error_str or "429" in error_str:
+            message = "Límite de API alcanzado. Espera unos minutos antes de intentar nuevamente."
+        elif "api key" in error_str or "401" in error_str:
+            message = "Problema con la clave de API. Verifica tu configuración en Ajustes."
+        elif "quota" in error_str or "billing" in error_str:
+            message = "Cuota de API agotada. Revisa tu plan de OpenAI."
+        elif "network" in error_str or "connection" in error_str:
+            message = "Error de conexión. Verifica tu conexión a internet."
+        elif "model" in error_str:
+            message = "Modelo no disponible. Puede que el servicio esté temporalmente inactivo."
+        else:
+            message = f"Error generando audio: {error}"
+        
+        # Mostrar mensaje al usuario
+        QMessageBox.warning(self, "Error de síntesis de voz", message)
+        
+        # Log detallado para debugging
+        print(f"Detalles del error de TTS: {error}")
     def _cancel_audio_generation(self):
         """Cancela la generación de audio en progreso"""
         self._audio_generation_active = False
