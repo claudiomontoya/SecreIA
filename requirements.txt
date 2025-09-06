@@ -1,0 +1,16 @@
+PySide6>=6.6.0
+openai>=1.30.0
+chromadb==0.4.24
+sounddevice>=0.4.6
+soundfile>=0.12.1
+numpy>=1.24.0,<2.0.0
+posthog>=3.0.0
+tqdm>=4.60.0
+requests>=2.25.0
+pyperclip>=1.8.2
+pyautogui>=0.9.54
+packaging>=21.0
+typing-extensions>=4.0.0
+SpeechRecognition>=3.10.0
+pytz>=2023.3
+pygame>=2.5.0

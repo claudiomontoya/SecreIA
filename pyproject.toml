@@ -1,0 +1,20 @@
+[project]
+name = "secretaria-ai"
+version = "0.1.0"
+description = "Secretaria AI de escritorio para notas, transcripciones y búsqueda con RAG."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "PySide6>=6.6",
+    "openai>=1.30.0",
+    "chromadb>=0.5.0",
+    "sounddevice>=0.4.6",
+    "soundfile>=0.12.1",
+    "numpy>=1.26.0",
+]
+
+[project.scripts]
+SecreIA = "app.main:main"
+
+[tool.pyinstaller]
+# opcional: parametros para pyinstaller si se usa programáticamente
