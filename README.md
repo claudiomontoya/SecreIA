@@ -7,6 +7,16 @@
 ![OpenAI](https://img.shields.io/badge/OpenAI-API-412991?style=flat-square&logo=openai&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)
 
+## 📸 Vista previa
+
+<div align="center">
+
+| | | |
+|---|---|---|
+| ![img1](assets/img/img1.jpeg) | ![img2](assets/img/img2.jpeg) | ![img3](assets/img/img3.jpeg) |
+| ![img4](assets/img/img4.jpeg) | ![img5](assets/img/img5.jpeg) | ![img6](assets/img/img6.jpeg) |
+
+</div>
 SecreIA es una aplicación nativa para macOS que combina gestión inteligente de notas, transcripción de audio en tiempo real y análisis con IA para maximizar tu productividad. Diseñada específicamente para profesionales que necesitan organizar información de manera eficiente.
 
 ## ✨ Características principales
@@ -213,17 +223,6 @@ export DEBUG=1
 
 # Ejecutar en modo desarrollo
 python run_app.py
-```
-
-### Estructura de testing
-
-```bash
-# Ejecutar tests
-python -m pytest tests/
-
-# Test específicos
-python -m pytest tests/test_transcription.py -v
-python -m pytest tests/test_vectorstore.py -v
 ```
 
 ### Contribuir

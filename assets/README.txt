@@ -1,1 +1,0 @@
-Coloca aquí íconos/recursos si los necesitas.
