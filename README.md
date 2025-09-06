@@ -46,13 +46,37 @@ SecreIA es una aplicación nativa para macOS que combina gestión inteligente de
 
 ### Instalación automática
 
+# 🛠️ flujo de construcción y firma para SecreIA
+
+## Generar certificado de firma de código en macOS
+
+1. Abre **Acceso a Llaveros** → selecciona el llavero **Inicio de sesión**.
+2. Menú **Acceso a Llaveros > Asistente de Certificados > Crear un Certificado…**
+3. Configura:
+
+   * **Nombre**: `SecreIA Developer` (puedes usar otro, solo recuerda el nombre exacto).
+   * **Identidad de certificado**: **Firma de código**.
+   * **Ubicación**: **Inicio de sesión**.
+4. Una vez creado:
+
+   * Expande el certificado → debe aparecer la **clave privada** debajo.
+   * Doble clic → pestaña **Confiar** → en **Firma de código** selecciona **Siempre Confiar**.
+5. Confirma con tu contraseña.
+6. Comprueba que aparece en terminal:
+
+   ```bash
+   security find-identity -v -p codesigning
+   ```
+
+# 🛠️ construcción Automática
+
 ```bash
 # Clonar el repositorio
 git clone https://github.com/claudiomontoya/SecreIA.git
 cd SecreIA
 
 # Ejecutar script de construcción
-chmod +x build_mac.sh
+chmod +x build_signed.sh
 ./build_mac.sh
 ```
 
