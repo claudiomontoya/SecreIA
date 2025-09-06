@@ -250,15 +250,5 @@ Este proyecto está licenciado bajo la Licencia MIT. Ver el archivo [LICENSE](LI
 
 - **Issues**: [GitHub Issues](https://github.com/claudiomontoya/SecreIA/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/claudiomontoya/SecreIA/discussions)
-- **Email**: soporte@secreia.app
+- **Email**: claudio.montoya@biopc.cl
 
-## 🙏 Agradecimientos
-
-- [OpenAI](https://openai.com) por APIs de IA
-- [Qt/PySide6](https://qt.io) por el framework de interfaz
-- [ChromaDB](https://www.trychroma.com) por búsqueda vectorial
-- Comunidad Python por las librerías open source
-
----
-
-**Hecho con ❤️ para la comunidad de macOS**
