@@ -54,6 +54,16 @@ SecreIA es una aplicación nativa para macOS que combina gestión inteligente de
 - Micrófono (para transcripción)
 - Conexión a internet (para funciones de IA)
 
+#### Windows (Beta)
+- Windows 10 versión 1903 o superior / Windows 11
+- 4 GB de RAM mínimo (8 GB recomendado)
+- 2 GB de espacio libre en disco
+- Micrófono (para transcripción)
+- Conexión a internet (para funciones de IA)
+
+> **Nota**: El soporte para Windows está en fase beta. Algunas funciones pueden requerir configuración adicional.
+
+
 ### Instalación automática
 
 # 🛠️ flujo de construcción y firma para SecreIA
