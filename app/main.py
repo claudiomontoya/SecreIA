@@ -37,7 +37,6 @@ import pygame
 import tempfile
 import subprocess
 
-
 from app.settings import Settings
 from app.db import NotesDB, Note
 from app.ai import AIService
@@ -46,6 +45,341 @@ from app.vectorstore import VectorIndex
 import pyperclip
 
 APP_NAME = "SecreIA"
+# Agregar después de los imports existentes (línea ~40)
+
+
+class AnalysisWorker(QThread):
+    """Worker thread para análisis RAG sin bloquear UI"""
+    
+    # Señales para comunicación thread-safe
+    analysis_finished = Signal(str)  # respuesta final
+    analysis_error = Signal(str)     # error
+    analysis_progress = Signal(str)  # actualizaciones de progreso
+    analysis_streaming = Signal(str)  # NUEVO: para streaming de texto
+    
+    def __init__(self, db: 'NotesDB', vector: 'VectorIndex', ai: 'AIService', 
+                 question: str, k_value: int):
+        super().__init__()
+        self.db = db
+        self.vector = vector
+        self.ai = ai
+        self.question = question
+        self.k_value = k_value
+        
+    def run(self):
+        """Ejecuta análisis en hilo separado con streaming"""
+        try:
+            self.analysis_progress.emit("Verificando índice vectorial...")
+            
+            # VERIFICACIÓN FORZADA DEL VECTOR STORE
+            total_chunks = self.vector.col.count()
+            if total_chunks == 0:
+                self.analysis_progress.emit("Reindexando notas existentes...")
+                self._force_reindex()
+                total_chunks = self.vector.col.count()
+            
+            if total_chunks == 0:
+                self.analysis_finished.emit("No hay notas indexadas en el sistema. Crea algunas notas primero.")
+                return
+            
+            self.analysis_progress.emit("Buscando documentos relevantes...")
+            retrieved = self.vector.search_optimized(self.question, top_k=self.k_value)
+            
+            if not retrieved:
+                self.analysis_finished.emit("No se encontraron notas relevantes para responder a tu pregunta.")
+                return
+            
+            self.analysis_progress.emit(f"Analizando {len(retrieved)} documentos...")
+            note_ids = [int(r["note_id"]) for r in retrieved]
+            contexts = self._load_contexts_batch(note_ids, retrieved)
+            
+            if not contexts:
+                self.analysis_finished.emit("No se pudieron cargar las notas relevantes.")
+                return
+            
+            self.analysis_progress.emit("Generando análisis con IA...")
+            self._generate_streaming_response(contexts)
+            
+        except Exception as e:
+            self.analysis_error.emit(f"Error en el análisis: {str(e)}")
+
+    def _force_reindex(self):
+        """Fuerza reindexación de todas las notas desde SQLite hacia vectorial"""
+        try:
+            print("🔄 Iniciando reindexación forzada...")
+            all_notes = self.db.list_notes(limit=1000)
+            
+            for i, note in enumerate(all_notes):
+                try:
+                    self.vector.index_note(
+                        note.id, note.title, note.content, 
+                        note.category, note.tags, note.source
+                    )
+                    if i % 10 == 0:  # Log cada 10 notas
+                        print(f"✅ Reindexadas {i+1}/{len(all_notes)} notas")
+                except Exception as e:
+                    print(f"❌ Error reindexando nota {note.id}: {e}")
+                    
+            print(f"✅ Reindexación completa: {len(all_notes)} notas procesadas")
+            
+        except Exception as e:
+            print(f"❌ Error en reindexación forzada: {e}")
+    def _generate_streaming_response(self, contexts: list):
+        """Genera respuesta con streaming"""
+        try:
+            # Usar el método de streaming de AIService
+            full_response = ""
+            
+            for chunk in self.ai.answer_with_context_streaming(
+                self.question, 
+                contexts, 
+                extended_analysis=True,
+                max_tokens=2000
+            ):
+                if chunk:
+                    full_response += chunk
+                    self.analysis_streaming.emit(chunk)  # Emitir cada chunk
+            
+            # Formatear respuesta final con fuentes
+            final_response = f"{full_response}\n\n"
+            final_response += "─" * 50 + "\n"
+            final_response += "📚 Fuentes consultadas:\n\n"
+            for i, context in enumerate(contexts, 1):
+                final_response += f"{i}. {context['title']}\n"
+            
+            self.analysis_finished.emit(final_response)
+            
+        except Exception as e:
+            self.analysis_error.emit(f"Error generando respuesta: {str(e)}")
+    
+    def _load_contexts_batch(self, note_ids: list, retrieved: list) -> list:
+        """Carga contextos SOLO desde base vectorial - SIN SQLite"""
+        try:
+            # AGRUPAR CHUNKS POR NOTE_ID DESDE RETRIEVED
+            notes_data = {}
+            
+            for result in retrieved:
+                note_id = int(result["note_id"])
+                title = result.get("title", "Sin título")
+                snippet = result.get("snippet", "")
+                
+                if note_id not in notes_data:
+                    notes_data[note_id] = {
+                        "title": title,
+                        "chunks": [],
+                        "score": result.get("score", 0)
+                    }
+                
+                # Limpiar snippet si tiene prefijo de título
+                content = snippet
+                if content.startswith("Título:"):
+                    lines = content.split("\n", 2)
+                    if len(lines) >= 3:
+                        content = lines[2]
+                
+                notes_data[note_id]["chunks"].append({
+                    "content": content,
+                    "score": result.get("score", 0)
+                })
+            
+            # RECONSTRUIR CONTEXTOS DESDE CHUNKS AGRUPADOS
+            contexts = []
+            for note_id in note_ids:
+                if note_id in notes_data:
+                    note_data = notes_data[note_id]
+                    
+                    # Combinar chunks de la misma nota
+                    chunk_contents = [chunk["content"] for chunk in note_data["chunks"]]
+                    combined_content = " ".join(chunk_contents)
+                    
+                    # Limitar contenido por tokens aproximados
+                    max_content_chars = min(3000, len(combined_content))
+                    final_content = combined_content[:max_content_chars]
+                    
+                    contexts.append({
+                        "title": note_data["title"],
+                        "content": final_content
+                    })
+            
+            return contexts[:5]  # Limitar a top 5
+            
+        except Exception as e:
+            print(f"Error cargando contextos desde vectorial: {e}")
+            return []
+
+class SummaryWorker(QThread):
+    """Worker thread para resumen con streaming"""
+    
+    # Señales para comunicación thread-safe
+    summary_finished = Signal(str)  # resumen final
+    summary_error = Signal(str)     # error
+    summary_progress = Signal(str)  # actualizaciones de progreso
+    summary_streaming = Signal(str)  # streaming de texto
+    
+    def __init__(self, vector: 'VectorIndex', ai: 'AIService'):
+        super().__init__()
+        self.vector = vector
+        self.ai = ai
+        
+    def run(self):
+        """Ejecuta generación de resumen con streaming"""
+        try:
+            from datetime import datetime, timedelta
+            import pytz
+            
+            chile_tz = pytz.timezone('America/Santiago')
+            now = datetime.now(chile_tz)
+            three_days_ago = now - timedelta(days=3)
+            
+            self.summary_progress.emit("Consultando base vectorial...")
+            
+            # OBTENER TODOS LOS CHUNKS
+            try:
+                all_data = self.vector.col.get(include=["metadatas", "documents"])
+            except Exception as e:
+                self.summary_error.emit(f"Error accediendo a base vectorial: {e}")
+                return
+            
+            if not all_data or not all_data.get("metadatas"):
+                self.summary_error.emit("No hay datos en la base vectorial.")
+                return
+            
+            self.summary_progress.emit("Procesando chunks de notas...")
+            
+            # AGRUPAR POR NOTE_ID Y FILTRAR POR FECHA
+            notes_data = {}
+            for doc, meta in zip(all_data["documents"], all_data["metadatas"]):
+                note_id = meta["note_id"]
+                title = meta["title"]
+                created_at = meta.get("created_at", "")
+                
+                # FILTRAR POR FECHA
+                try:
+                    if created_at:
+                        note_date = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                        if note_date.tzinfo is None:
+                            note_date = note_date.replace(tzinfo=pytz.UTC)
+                        note_date_chile = note_date.astimezone(chile_tz)
+                        
+                        if note_date_chile < three_days_ago:
+                            continue
+                except Exception:
+                    pass
+                
+                # AGRUPAR CONTENIDO
+                if note_id not in notes_data:
+                    notes_data[note_id] = {
+                        "title": title,
+                        "chunks": [],
+                        "created_at": created_at
+                    }
+                
+                chunk_content = doc
+                if chunk_content.startswith("Título:"):
+                    lines = chunk_content.split("\n", 2)
+                    if len(lines) >= 3:
+                        chunk_content = lines[2]
+                
+                notes_data[note_id]["chunks"].append({
+                    "content": chunk_content,
+                    "chunk_type": meta.get("chunk_type", "content"),
+                    "start": meta.get("start", 0)
+                })
+            
+            if not notes_data:
+                self.summary_error.emit("No se encontraron notas de los últimos 3 días.")
+                return
+            
+            self.summary_progress.emit(f"Reconstruyendo {len(notes_data)} notas...")
+            
+            # RECONSTRUIR NOTAS
+            recent_notes = []
+            for note_id, note_data in notes_data.items():
+                chunks = sorted(note_data["chunks"], key=lambda x: x["start"])
+                content_parts = []
+                for chunk in chunks:
+                    if chunk["chunk_type"] != "title":
+                        content_parts.append(chunk["content"])
+                
+                combined_content = " ".join(content_parts)
+                recent_notes.append({
+                    "title": note_data["title"],
+                    "content": combined_content,
+                    "created_at": note_data["created_at"]
+                })
+            
+            # Limitar a 20 notas más recientes
+            recent_notes = sorted(recent_notes, 
+                                key=lambda x: x.get("created_at", ""), 
+                                reverse=True)[:20]
+            
+            self.summary_progress.emit(f"Generando resumen de {len(recent_notes)} notas...")
+            
+            # PREPARAR CONTENIDO
+            content_parts = []
+            for note in recent_notes:
+                date_str = format_date_chile(note["created_at"]) if note["created_at"] else "Fecha desconocida"
+                content_parts.append(f"=== {note['title']} ({date_str}) ===\n{note['content']}\n")
+            
+            combined_content = "\n".join(content_parts)
+            if len(combined_content) > 15000:
+                combined_content = combined_content[:15000] + "\n[...contenido truncado]"
+            
+            self.summary_progress.emit("Generando resumen con IA...")
+            
+            # GENERAR RESUMEN CON STREAMING
+            self._generate_streaming_summary(combined_content)
+            
+        except Exception as e:
+            self.summary_error.emit(f"Error generando resumen: {str(e)}")
+
+    def _generate_streaming_summary(self, content: str):
+        """Genera resumen con streaming"""
+        try:
+            system_prompt = """Eres el Asistente de Claudio Montoya jefe del departamento de desarrollo de software, especializado en crear resúmenes ejecutivos claros y útiles. 
+            Analiza las notas proporcionadas y crea un resumen estructurado que incluya:
+            
+            #Formato Salida
+                -texto sin formato 
+                -valido para tranformar a audio incluye punto y comas para pausas.
+                
+            1. **Resumen Ejecutivo**: Los aspectos más críticos y urgentes, enfocándote en decisiones tomadas, problemas identificados y avances concretos
+            2. **Actividades Principales**: Eventos específicos, reuniones importantes y acciones ejecutadas (evita repetir títulos obvios)
+            3. **Ideas y Decisiones Clave**: Decisiones técnicas, criterios establecidos, metodologías adoptadas y soluciones propuestas
+            4. **Pendientes y Acciones**: Tareas específicas identificadas, responsabilidades asignadas y plazos mencionados
+            5. **Temas Recurrentes**: Patrones en problemáticas, enfoques técnicos o procesos que aparecen múltiples veces
+            6. **Filtros de Relevancia**: 
+               - INCLUYE: decisiones técnicas, problemas operativos, configuraciones, procesos de trabajo
+               - EXCLUYE: información obvia del contexto, títulos redundantes, generalidades sin valor
+            
+            Mantén un tono profesional útil para TTS de macOS nativo. Evita caracteres o símbolos que provoquen problemas de transcripción. Enfócate en INSIGHTS reales, no en información evidente."""
+            
+            user_prompt = f"Analiza y resume las siguientes notas de los últimos 3 días:\n\n{content}"
+            
+            # STREAMING CON OPENAI
+            full_response = ""
+            
+            stream = self.ai.client.chat.completions.create(
+                model=self.ai.settings.chat_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.3,
+                max_tokens=3500,
+                stream=True  # HABILITAR STREAMING
+            )
+            
+            for chunk in stream:
+                if chunk.choices[0].delta.content:
+                    content_chunk = chunk.choices[0].delta.content
+                    full_response += content_chunk
+                    self.summary_streaming.emit(content_chunk)  # Emitir cada chunk
+            
+            self.summary_finished.emit(full_response)
+            
+        except Exception as e:
+            self.summary_error.emit(f"Error generando resumen: {str(e)}")
 
 def format_date_chile(date_str: str) -> str:
     """Formatea fecha para Chile con información consistente"""
@@ -201,11 +535,12 @@ class StatusBadge(QLabel):
 class SummaryTab(QWidget):
     """Tab de Resumen IA con síntesis de voz - NUEVO"""
     
-    def __init__(self, settings: Settings, db: NotesDB, ai: AIService):
+    def __init__(self, settings: Settings, db: NotesDB, ai: AIService, vector: Optional[VectorIndex] = None):
         super().__init__()
         self.settings = settings
         self.db = db
         self.ai = ai
+        self.vector = vector
         self.audio_file = None
         self.audio_playing = False
         self.audio_thread = None
@@ -258,9 +593,10 @@ class SummaryTab(QWidget):
         self.btn_generate.setFixedWidth(400)
         self.btn_generate.clicked.connect(self._generate_summary)
         
-        if not self.ai.settings.openai_api_key:
+        # CORREGIR VERIFICACIÓN - usar self.vector en lugar de self.ai.vector
+        if not self.ai.settings.openai_api_key or not self.vector:
             self.btn_generate.setEnabled(False)
-            self.btn_generate.setToolTip("Requiere configuración de OpenAI API")
+            self.btn_generate.setToolTip("Requiere configuración de OpenAI API y base vectorial")
         
         layout.addWidget(self.btn_generate, alignment=Qt.AlignCenter)
         
@@ -338,114 +674,92 @@ class SummaryTab(QWidget):
         layout.addWidget(audio_controls)
     
     def _generate_summary(self):
-        """Genera resumen de los últimos 3 días"""
+        """Genera resumen de los últimos 3 días con streaming"""
         if not self.ai.settings.openai_api_key:
             QMessageBox.information(self, APP_NAME, 
-                                  "El resumen IA está deshabilitado.\n"
-                                  "Configura tu OpenAI API key en Ajustes.")
+                                "El resumen IA está deshabilitado.\n"
+                                "Configura tu OpenAI API key en Ajustes.")
             return
         
-        # Mostrar progreso
-        self._show_progress("Consultando notas de los últimos 3 días...")
+        if not self.vector:
+            QMessageBox.information(self, APP_NAME, 
+                                "Base vectorial no disponible.\n"
+                                "Asegúrate de tener notas indexadas.")
+            return
         
-        # Usar QTimer para no bloquear UI
-        QTimer.singleShot(100, self._do_generate_summary)
+        # Preparar UI para resumen asíncrono
+        self._start_summary_ui()
+        
+        # Crear y lanzar worker thread
+        self.summary_worker = SummaryWorker(self.vector, self.ai)
+        
+        # Conectar señales
+        self.summary_worker.summary_finished.connect(self._on_summary_finished)
+        self.summary_worker.summary_error.connect(self._on_summary_error)
+        self.summary_worker.summary_progress.connect(self._on_summary_progress)
+        self.summary_worker.summary_streaming.connect(self._on_summary_streaming)  # NUEVO
+        
+        # Iniciar resumen en hilo separado
+        self.summary_worker.start()
+
+    def _start_summary_ui(self):
+        """Configura UI para estado de resumen"""
+        self.btn_generate.setText("Generando...")
+        self.btn_generate.setEnabled(False)
+        self.summary_text.clear()
+        self.summary_text.setPlaceholderText("🔄 Generando resumen...")
+
+    def _on_summary_progress(self, message: str):
+        """Actualiza progreso en UI"""
+        self.summary_text.setPlaceholderText(f"🔄 {message}")
+
+    def _on_summary_streaming(self, chunk: str):
+        """Maneja chunks de streaming en tiempo real"""
+        current_text = self.summary_text.toPlainText()
+        
+        # Si es el primer chunk, limpiar placeholder
+        if "🔄" in current_text or "El resumen aparecerá aquí..." in current_text:
+            self.summary_text.clear()
+            current_text = ""
+        
+        # Añadir nuevo chunk
+        self.summary_text.setPlainText(current_text + chunk)
+        
+        # Mover cursor al final
+        cursor = self.summary_text.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        self.summary_text.setTextCursor(cursor)
+        
+        # Actualizar visualmente
+        self.summary_text.update()
+        QCoreApplication.processEvents()
+
+    def _on_summary_finished(self, response: str):
+        """Maneja finalización exitosa Y ACTIVA AUDIO"""
+        self._reset_summary_ui()
+        self.btn_copy_summary.setEnabled(True)
+        
+        # GENERAR AUDIO AUTOMÁTICAMENTE CUANDO TERMINA EL STREAM
+        final_text = self.summary_text.toPlainText()
+        if final_text.strip():
+            self._generate_audio(final_text)
+
+    def _on_summary_error(self, error: str):
+        """Maneja errores de resumen"""
+        self.summary_text.clear()
+        self.summary_text.setPlainText(f"Error generando resumen: {error}")
+        self._reset_summary_ui()
+
+    def _reset_summary_ui(self):
+        """Resetea UI después de resumen"""
+        self.btn_generate.setText("🤖 Generar Resumen de últimos 3 días")
+        self.btn_generate.setEnabled(True)
+        
+        # Limpiar worker
+        if hasattr(self, 'summary_worker'):
+            self.summary_worker.deleteLater()
     
-    def _do_generate_summary(self):
-        """Ejecuta la generación real del resumen"""
-        try:
-            # Calcular fecha límite (últimos 3 días)
-            chile_tz = pytz.timezone('America/Santiago')
-            now = datetime.now(chile_tz)
-            three_days_ago = now - timedelta(days=3)
-            
-            self._update_progress("Obteniendo notas recientes...")
-            
-            # Obtener todas las notas y filtrar por fecha
-            all_notes = self.db.list_notes(limit=10000)
-            recent_notes = []
-            
-            for note in all_notes:
-                try:
-                    # Parsear fecha de actualización
-                    updated_at = note.updated_at.replace('Z', '+00:00')
-                    note_date = datetime.fromisoformat(updated_at)
-                    
-                    # Si no tiene timezone, asumir UTC y convertir a Chile
-                    if note_date.tzinfo is None:
-                        note_date = note_date.replace(tzinfo=pytz.UTC)
-                    
-                    note_date_chile = note_date.astimezone(chile_tz)
-                    
-                    if note_date_chile >= three_days_ago:
-                        recent_notes.append(note)
-                except Exception:
-                    # En caso de error parseando fecha, incluir la nota
-                    recent_notes.append(note)
-            
-            if not recent_notes:
-                self._hide_progress()
-                self.summary_text.setPlainText("No se encontraron notas en los últimos 3 días.")
-                return
-            
-            self._update_progress(f"Analizando {len(recent_notes)} notas...")
-            
-            # Preparar contenido para el resumen
-            content_parts = []
-            for i, note in enumerate(recent_notes[:20]):  # Limitar a 20 notas más recientes
-                date_str = format_date_chile(note.updated_at)
-                content_parts.append(f"=== {note.title} ({date_str}) ===\n{note.content}\n")
-            
-            combined_content = "\n".join(content_parts)
-            
-            # Truncar si es muy largo (límite de tokens)
-            if len(combined_content) > 15000:
-                combined_content = combined_content[:15000] + "\n[...contenido truncado]"
-            
-            self._update_progress("Generando resumen con IA...")
-            
-            # Crear prompt para el resumen
-            system_prompt = """Eres el Asistente de Claudio Montoya jefe del departamento de desarrollo de software, estas especializado en crear resúmenes ejecutivos claros y útiles. 
-            Analiza las notas proporcionadas y crea un resumen estructurado que incluya:
-            
-            1. **Resumen Ejecutivo**: Los puntos más importantes en 2-3 oraciones enfocado a los proyectos, urgencia y hallazgos claves
-            2. **Actividades Principales**: Las actividades y eventos más relevantes
-            3. **Ideas y Decisiones Clave**: Ideas importantes, decisiones tomadas
-            4. **Pendientes y Acciones**: Tareas pendientes o acciones identificadas
-            5. **Temas Recurrentes**: Patrones o temas que aparecen múltiples veces
-            6. **Descarta Notas Irrelevantes**: Omite notas que no estan en funcion de proyecto eventos problemas o funciones principales
-            
-            Mantén un tono profesional util para ul tts de macos nativo evita caracteres o simbolos que provoquen problemas de transcripcion. El resumen debe ser útil para revisar rápidamente los últimos días."""
-            
-            user_prompt = f"Analiza y resume las siguientes notas de los últimos 3 días:\n\n{combined_content}"
-            
-            # Generar resumen con OpenAI
-            response = self.ai.client.chat.completions.create(
-                model=self.ai.settings.chat_model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.3,
-                max_tokens=1500
-            )
-            
-            summary = response.choices[0].message.content.strip()
-            
-            # Mostrar resumen
-            self._hide_progress()
-            self.summary_text.setPlainText(summary)
-            self.btn_copy_summary.setEnabled(True)
-            
-            # Generar audio
-            self._generate_audio(summary)
-            
-        except Exception as e:
-            self._hide_progress()
-            error_msg = f"Error generando resumen: {str(e)}"
-            self.summary_text.setPlainText(error_msg)
-            QMessageBox.critical(self, "Error", error_msg)
-    
+
     def _generate_audio(self, text: str):
         """Genera audio del resumen usando OpenAI TTS"""
         try:
@@ -523,52 +837,17 @@ class SummaryTab(QWidget):
                     os.remove(temp_path)
                 except:
                     pass
+    
     def _auto_play_audio(self):
         """Reproduce audio automáticamente después de generarlo"""
         if self.audio_file and os.path.exists(self.audio_file) and not self.audio_playing:
-            self._play_audio()            
+            self._play_audio()
+    
     def _show_simple_error(self, message: str):
         """Muestra error simple"""
         self._hide_progress()
         QMessageBox.warning(self, "Error de audio", message)
-    def _get_chilean_voice_instructions(self) -> str:
-        """Devuelve instrucciones específicas para tono chileno"""
-        return (
-            "Habla con un tono conversacional y cercano, característico del español chileno. "
-            "Mantén una velocidad moderada, pronunciación clara y natural. "
-            "Usa un registro informal pero profesional, como si fueras un asistente amigable. "
-            "Haz pausas naturales entre oraciones y enfatiza suavemente los puntos importantes."
-        )
-
-    def _show_error_message(self, error: str):
-        """Muestra mensaje de error específico y útil"""
-        self._hide_progress()
-        
-        # Detectar tipos de error y dar mensajes claros
-        error_str = str(error).lower()
-        
-        if "rate limit" in error_str or "429" in error_str:
-            message = "Límite de API alcanzado. Espera unos minutos antes de intentar nuevamente."
-        elif "api key" in error_str or "401" in error_str:
-            message = "Problema con la clave de API. Verifica tu configuración en Ajustes."
-        elif "quota" in error_str or "billing" in error_str:
-            message = "Cuota de API agotada. Revisa tu plan de OpenAI."
-        elif "network" in error_str or "connection" in error_str:
-            message = "Error de conexión. Verifica tu conexión a internet."
-        elif "model" in error_str:
-            message = "Modelo no disponible. Puede que el servicio esté temporalmente inactivo."
-        else:
-            message = f"Error generando audio: {error}"
-        
-        # Mostrar mensaje al usuario
-        QMessageBox.warning(self, "Error de síntesis de voz", message)
-        
-        # Log detallado para debugging
-        print(f"Detalles del error de TTS: {error}")
-    def _cancel_audio_generation(self):
-        """Cancela la generación de audio en progreso"""
-        self._audio_generation_active = False
-        self._hide_progress()        
+    
     def _toggle_audio(self):
         """Alterna reproducción de audio"""
         if not self.audio_file or not os.path.exists(self.audio_file):
@@ -702,7 +981,6 @@ class SummaryTab(QWidget):
             print(f"Error limpiando SummaryTab: {e}")
         finally:
             event.accept()
-
 
 class AdvancedSearchBar(QWidget):
     """Barra de búsqueda simple"""
@@ -1707,10 +1985,7 @@ class EnhancedNoteEditor(QWidget):
     def _do_save(self, title: str, content: str, category: str):
         """Ejecuta el guardado real"""
         try:
-            
             chile_tz = pytz.timezone('America/Santiago')
-            
-            # Usar el método para obtener título final
             final_title = self._get_final_title()
             
             self.db.add_category(category)
@@ -1730,23 +2005,28 @@ class EnhancedNoteEditor(QWidget):
             note_id = self.db.upsert_note(note)
             self.current_note_id = note_id
 
-            # Indexar si hay vector store
+            # INDEXACIÓN FORZADA Y VERIFICADA
             if self.vector:
                 try:
-                    self.vector.index_note(note_id, final_title, content, category, [], "manual")  # CAMBIO AQUÍ
+                    self.vector.index_note(note_id, final_title, content, category, [], "manual")
+                    print(f"Nota {note_id} indexada correctamente en vector store")
                 except Exception as e:
-                    print(f"Error indexando: {e}")
+                    print(f"Error indexando nota {note_id}: {e}")
+                    # REINTENTAR INICIALIZACIÓN DEL VECTOR STORE
+                    try:
+                        from app.vectorstore import VectorIndex
+                        self.vector = VectorIndex(self.ai.settings, self.ai)
+                        self.vector.index_note(note_id, final_title, content, category, [], "manual")
+                        print(f"Vector store reinicializado y nota {note_id} indexada")
+                    except Exception as e2:
+                        print(f"Error crítico con vector store: {e2}")
+            else:
+                print("Vector store no disponible - nota solo guardada en SQLite")
 
             self.refresh_categories()
             self.is_dirty = False
-            
-            # Actualizar título en UI con el final
             self.title_edit.setText(final_title)
-            
-            # Mostrar éxito
             self._show_success_state()
-            
-            # Emitir señal para actualizar la lista
             self.note_saved.emit()
             
         except Exception as e:
@@ -3666,8 +3946,9 @@ class SearchTab(QWidget):
         finally:
             self.btn_semantic.setText("🧠 Búsqueda semántica")
             self.btn_semantic.setEnabled(True)
+
 class AnalyzeTab(QWidget):
-    """Tab de análisis con RAG estilo Apple - MEJORADO"""
+    """Tab de análisis con RAG estilo Apple - MEJORADO con streaming"""
     
     def __init__(self, settings: Settings, db: NotesDB, vector: Optional[VectorIndex], ai: AIService):
         super().__init__()
@@ -3820,53 +4101,93 @@ class AnalyzeTab(QWidget):
     def ask(self):
         if not self.vector:
             QMessageBox.information(self, APP_NAME, 
-                                  "El análisis inteligente está deshabilitado.\n"
-                                  "Configura tu OpenAI API key en Ajustes.")
+                                "El análisis inteligente está deshabilitado.\n"
+                                "Configura tu OpenAI API key en Ajustes.")
             return
             
         question = self.q_edit.text().strip()
         if not question:
             return
-            
+        
+        # Preparar UI para análisis asíncrono
+        self._start_analysis_ui()
+        
+        # Crear y lanzar worker thread
+        self.analysis_worker = AnalysisWorker(
+            self.db, self.vector, self.ai, question, self.k_spin.value()
+        )
+        
+        # Conectar señales (incluyendo nueva señal de streaming)
+        self.analysis_worker.analysis_finished.connect(self._on_analysis_finished)
+        self.analysis_worker.analysis_error.connect(self._on_analysis_error)
+        self.analysis_worker.analysis_progress.connect(self._on_analysis_progress)
+        self.analysis_worker.analysis_streaming.connect(self._on_analysis_streaming)  # NUEVO
+        
+        # Iniciar análisis en hilo separado
+        self.analysis_worker.start()
+
+    def _start_analysis_ui(self):
+        """Configura UI para estado de análisis"""
         self.btn_ask.setText("Analizando...")
         self.btn_ask.setEnabled(False)
         self.answer.clear()
+        self.answer.setPlaceholderText("🔄 Analizando documentos...")
+
+    def _on_analysis_progress(self, message: str):
+        """Actualiza progreso en UI"""
+        self.answer.setPlaceholderText(f"🔄 {message}")
+
+    def _on_analysis_streaming(self, chunk: str):
+        """Maneja chunks de streaming en tiempo real"""
+        current_text = self.answer.toPlainText()
         
-        QTimer.singleShot(100, lambda: self._do_analysis(question))
-    
-    def _do_analysis(self, question: str):
-        try:
-            retrieved = self.vector.search(question, top_k=self.k_spin.value())
-            if not retrieved:
-                self.answer.setPlainText("No se encontraron notas relevantes para responder a tu pregunta.")
-                return
-            
-            contexts = []
-            for r in retrieved:
-                n = self.db.get_note(int(r["note_id"]))
-                if n:
-                    contexts.append({"title": n.title, "content": n.content[:4000]})
-            
-            if not contexts:
-                self.answer.setPlainText("No se pudieron cargar las notas relevantes.")
-                return
-            
-            answer = self.ai.answer_with_context(question, contexts, extended_analysis=True)
-            
-            response_text = f"{answer}\n\n"
-            response_text += "─" * 50 + "\n"
-            response_text += "📚 Fuentes consultadas:\n\n"
-            for i, context in enumerate(contexts, 1):
-                response_text += f"{i}. {context['title']}\n"
-            
-            self.answer.setPlainText(response_text)
-            
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Error en el análisis: {e}")
-            self.answer.setPlainText(f"Error al procesar la consulta: {e}")
-        finally:
-            self.btn_ask.setText("🤖 Analizar")
-            self.btn_ask.setEnabled(True)
+        # Si es el primer chunk, limpiar placeholder
+        if "🔄" in current_text or "Las respuestas del análisis aparecerán aquí..." in current_text:
+            self.answer.clear()
+            current_text = ""
+        
+        # Añadir nuevo chunk
+        self.answer.setPlainText(current_text + chunk)
+        
+        # Mover cursor al final para que se vea el nuevo texto
+        cursor = self.answer.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        self.answer.setTextCursor(cursor)
+        
+        # Asegurar que el área de texto se actualice visualmente
+        self.answer.update()
+        QCoreApplication.processEvents()
+
+    def _on_analysis_finished(self, response: str):
+        """Maneja finalización exitosa"""
+        # Solo actualizar con fuentes si no se recibió por streaming
+        if "📚 Fuentes consultadas:" not in self.answer.toPlainText():
+            self.answer.setPlainText(response)
+        else:
+            # Ya se recibió por streaming, solo añadir fuentes si faltan
+            current_text = self.answer.toPlainText()
+            if "📚 Fuentes consultadas:" not in current_text:
+                # Extraer solo la parte de fuentes de la respuesta
+                if "📚 Fuentes consultadas:" in response:
+                    sources_part = response[response.find("📚 Fuentes consultadas:"):]
+                    self.answer.setPlainText(current_text + "\n\n" + sources_part)
+        
+        self._reset_analysis_ui()
+
+    def _on_analysis_error(self, error: str):
+        """Maneja errores de análisis"""
+        QMessageBox.critical(self, "Error", error)
+        self.answer.setPlaceholderText("❌ Error en el análisis")
+        self._reset_analysis_ui()
+
+    def _reset_analysis_ui(self):
+        """Resetea UI después de análisis"""
+        self.btn_ask.setText("🤖 Analizar")
+        self.btn_ask.setEnabled(True)
+        
+        # Limpiar worker
+        if hasattr(self, 'analysis_worker'):
+            self.analysis_worker.deleteLater()
 
 class SettingsTab(QWidget):
     """Tab de configuraciones estilo Apple - MEJORADO"""
@@ -5111,7 +5432,7 @@ class MainWindow(QMainWindow):
         self.transcribe_tab = EnhancedTranscribeTab(self.settings, self.db, self.vector, self.ai)
         self.search_tab = SearchTab(self.settings, self.db, self.vector, self.ai)
         self.analyze_tab = AnalyzeTab(self.settings, self.db, self.vector, self.ai)
-        self.summary_tab = SummaryTab(self.settings, self.db, self.ai)  # NUEVA LÍNEA
+        self.summary_tab = SummaryTab(self.settings, self.db, self.ai, self.vector)  # NUEVA LÍNEA
         self.categories_tab = CategoriesTab(self.settings, self.db, self)
         self.settings_tab = SettingsTab(self.settings)
         
@@ -5153,8 +5474,14 @@ class MainWindow(QMainWindow):
         try:
             if self.settings.openai_api_key or os.environ.get("OPENAI_API_KEY"):
                 self.vector = VectorIndex(self.settings, self.ai)
+                # FORZAR VERIFICACIÓN DE INICIALIZACIÓN
+                test_count = self.vector.col.count()
+                print(f"Vector store inicializado correctamente con {test_count} chunks")
+            else:
+                print("Vector store deshabilitado: No hay API key")
         except Exception as e:
             print(f"Vector store deshabilitado: {e}")
+            self.vector = None
     
 
     

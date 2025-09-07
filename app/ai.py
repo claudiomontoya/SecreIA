@@ -185,7 +185,7 @@ class AIService:
                 "5. INFORMACIÓN FALTANTE\n"
                 "Aspectos importantes que no están cubiertos en el contexto proporcionado.\n\n"
             )
-            max_completion_tokens = 2500
+            max_completion_tokens = 3500
         else:
             system = (
                 "Eres una secretaria IA que contesta SOLO usando el contexto proporcionado. "
