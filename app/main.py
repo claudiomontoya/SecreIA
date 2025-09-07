@@ -1735,8 +1735,9 @@ class EnhancedNoteEditor(QWidget):
         layout.addWidget(self.stats_label)
         
         self.refresh_categories()
+    # En la clase EnhancedNoteEditor (línea ~890 aprox)
     def _delete_current_note(self):
-        """Elimina la nota actualmente cargada"""
+        """Elimina la nota actualmente cargada de forma atómica"""
         if not self.current_note_id:
             return
         
@@ -1753,34 +1754,48 @@ class EnhancedNoteEditor(QWidget):
             )
             
             if reply == QMessageBox.Yes:
-                # Eliminar de base de datos
-                self.db.delete_note(self.current_note_id)
+                # ELIMINACIÓN ATÓMICA
+                vector_success = False
                 
-                # Eliminar del vector store si existe
+                # 1. Eliminar de vector store primero
                 if self.vector:
                     try:
                         self.vector.delete_note_chunks(self.current_note_id)
-                    except Exception:
-                        pass
+                        vector_success = True
+                    except Exception as e:
+                        QMessageBox.critical(self, "Error", f"Error eliminando de índice vectorial: {e}")
+                        return
                 
-                # Eliminar archivo de audio si existe
+                # 2. Eliminar de SQLite solo si vector fue exitoso
+                try:
+                    self.db.delete_note(self.current_note_id)
+                except Exception as e:
+                    # Rollback: intentar restaurar en vector si se eliminó
+                    if vector_success and self.vector:
+                        try:
+                            self.vector.index_note(
+                                note.id, note.title, note.content, 
+                                note.category, note.tags, note.source
+                            )
+                        except:
+                            pass
+                    QMessageBox.critical(self, "Error", f"Error eliminando de base de datos: {e}")
+                    return
+                
+                # 3. Eliminar archivo de audio si existe
                 if note.audio_path and os.path.exists(note.audio_path):
                     try:
                         os.remove(note.audio_path)
                     except Exception:
                         pass
                 
-                # Limpiar editor
+                # 4. Limpiar editor y notificar
                 self.clear_editor()
-                
-                # Emitir señal para actualizar la lista
                 self.note_saved.emit()
-                
                 QMessageBox.information(self, "Eliminado", "Nota eliminada correctamente")
-                
+                    
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Error al eliminar: {e}")
-
     def _update_delete_button_visibility(self):
         """Actualiza visibilidad del botón eliminar según el estado"""
         # Mostrar botón eliminar solo si hay una nota cargada (no nueva)
@@ -1894,11 +1909,17 @@ class EnhancedNoteEditor(QWidget):
         self.loading_spinner.start()
         self.save_status.setText("Guardando...")
     
+    # En la clase EnhancedNoteEditor (línea ~750 aprox) - Reemplazar _do_save()
     def _do_save(self, title: str, content: str, category: str):
-        """Ejecuta el guardado real"""
+        """Ejecuta el guardado real de forma atómica"""
         try:
             chile_tz = pytz.timezone('America/Santiago')
             final_title = self._get_final_title()
+            
+            # Backup para rollback
+            old_note = None
+            if self.current_note_id:
+                old_note = self.db.get_note(self.current_note_id)
             
             self.db.add_category(category)
             
@@ -1914,33 +1935,38 @@ class EnhancedNoteEditor(QWidget):
                 updated_at=datetime.now(chile_tz).isoformat(),
             )
             
-            note_id = self.db.upsert_note(note)
-            self.current_note_id = note_id
+            # GUARDADO ATÓMICO
+            try:
+                # 1. Guardar en SQLite
+                note_id = self.db.upsert_note(note)
+                self.current_note_id = note_id
 
-            # INDEXACIÓN FORZADA Y VERIFICADA
-            if self.vector:
-                try:
-                    self.vector.index_note(note_id, final_title, content, category, [], "manual")
-                    print(f"Nota {note_id} indexada correctamente en vector store")
-                except Exception as e:
-                    print(f"Error indexando nota {note_id}: {e}")
-                    # REINTENTAR INICIALIZACIÓN DEL VECTOR STORE
+                # 2. Indexar en vector store
+                if self.vector:
                     try:
-                        from app.vectorstore import VectorIndex
-                        self.vector = VectorIndex(self.ai.settings, self.ai)
                         self.vector.index_note(note_id, final_title, content, category, [], "manual")
-                        print(f"Vector store reinicializado y nota {note_id} indexada")
-                    except Exception as e2:
-                        print(f"Error crítico con vector store: {e2}")
-            else:
-                print("Vector store no disponible - nota solo guardada en SQLite")
+                        print(f"Nota {note_id} indexada correctamente")
+                    except Exception as e:
+                        # Rollback SQLite si falla vector
+                        if old_note:
+                            try:
+                                self.db.upsert_note(old_note)
+                                self.current_note_id = old_note.id
+                            except:
+                                pass
+                        raise Exception(f"Error indexando en vector store: {e}")
 
-            self.refresh_categories()
-            self.is_dirty = False
-            self.title_edit.setText(final_title)
-            self._show_success_state()
-            self.note_saved.emit()
-            
+                # 3. Actualizar UI solo si todo fue exitoso
+                self.refresh_categories()
+                self.is_dirty = False
+                self.title_edit.setText(final_title)
+                self._show_success_state()
+                self.note_saved.emit()
+                
+            except Exception as e:
+                # Ya se hizo rollback arriba, solo mostrar error
+                self._show_error_state(str(e))
+                
         except Exception as e:
             self._show_error_state(str(e))
     def _show_success_state(self):
@@ -2370,8 +2396,9 @@ class EnhancedNotesView(QWidget):
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Error al exportar: {e}")
     
+    # En la clase EnhancedNotesView (línea ~1200 aprox) - Reemplazar _delete_note_from_menu()
     def _delete_note_from_menu(self, note_id: int, item: QListWidgetItem):
-        """Elimina nota desde menú contextual"""
+        """Elimina nota desde menú contextual de forma atómica"""
         note = self.db.get_note(note_id)
         if not note:
             return
@@ -2385,25 +2412,37 @@ class EnhancedNotesView(QWidget):
         
         if reply == QMessageBox.Yes:
             try:
-                self.db.delete_note(note_id)
+                # ELIMINACIÓN ATÓMICA (mismo patrón que arriba)
+                vector_success = False
                 
                 if self.vector:
                     try:
                         self.vector.delete_note_chunks(note_id)
-                    except Exception:
-                        pass
+                        vector_success = True
+                    except Exception as e:
+                        QMessageBox.critical(self, "Error", f"Error eliminando de índice: {e}")
+                        return
                 
-                # Eliminar archivo de audio si existe
+                try:
+                    self.db.delete_note(note_id)
+                except Exception as e:
+                    if vector_success and self.vector:
+                        try:
+                            self.vector.index_note(note.id, note.title, note.content, 
+                                                note.category, note.tags, note.source)
+                        except:
+                            pass
+                    QMessageBox.critical(self, "Error", f"Error eliminando: {e}")
+                    return
+                
+                # Limpiar UI
                 if note.audio_path and os.path.exists(note.audio_path):
                     try:
                         os.remove(note.audio_path)
                     except Exception:
                         pass
                 
-                # Remover de la lista
                 self.notes_list.takeItem(self.notes_list.row(item))
-                
-                # Limpiar editor si era la nota activa
                 if self.note_editor.current_note_id == note_id:
                     self.note_editor.clear_editor()
                 
@@ -2412,7 +2451,6 @@ class EnhancedNotesView(QWidget):
                 
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Error al eliminar: {e}")
-    
     def _on_note_selected(self, item):
         """Maneja selección de nota"""
         data = item.data(Qt.UserRole)
