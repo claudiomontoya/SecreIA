@@ -1259,3 +1259,35 @@ class VectorIndex:
             
         except Exception as e:
             return {"error": str(e)}
+    # AGREGAR a la clase VectorIndex:
+
+    def index_attachment(self, attachment_id: int, text: str) -> None:
+        """Indexa texto de adjunto"""
+        if not text.strip():
+            return
+        
+        chunk_id = str(uuid.uuid4())
+        metadata = {
+            "attachment_id": attachment_id,
+            "type": "attachment",
+            "created_at": datetime.utcnow().isoformat()
+        }
+        
+        try:
+            self.col.add(
+                documents=[text],
+                metadatas=[metadata],
+                ids=[chunk_id]
+            )
+        except Exception as e:
+            print(f"Error indexando adjunto {attachment_id}: {e}")
+
+    def delete_attachment(self, attachment_id: int) -> None:
+        """Elimina adjunto del índice"""
+        try:
+            results = self.col.get(where={"attachment_id": attachment_id})
+            ids = results.get("ids", [])
+            if ids:
+                self.col.delete(ids=ids)
+        except Exception:
+            pass    

@@ -46,9 +46,10 @@ fi
 echo "Limpiando archivos de construcción..."
 rm -rf .venv build/ dist/ __pycache__/ app/__pycache__/ *.spec entitlements.plist 2>/dev/null || true
 
-# Limpiar base de datos incompatible
-echo "Limpiando base de datos ChromaDB incompatible..."
+# Limpiar TODAS las bases de datos para evitar desincronización
+echo "Limpiando bases de datos para evitar conflictos..."
 rm -rf ~/.secretaria_ai/chroma/ 2>/dev/null || true
+rm -rf ~/.secretaria_ai/notes.db 2>/dev/null || true
 
 # Crear entorno virtual
 echo "Creando entorno virtual con Python 3.11..."
@@ -73,6 +74,9 @@ pip install pyaudio
 echo "Instalando resto de dependencias..."
 pip install -r requirements.txt pyinstaller
 
+echo "Instalando dependencias para adjuntos..."
+pip install PyMuPDF Pillow python-docx openpyxl
+
 # Verificar instalación crítica
 echo "Verificando instalaciones críticas..."
 python -c "
@@ -83,6 +87,12 @@ import sounddevice
 import soundfile
 import speech_recognition
 import pyaudio
+# AGREGAR: Verificar adjuntos
+import fitz  # PyMuPDF
+import PIL
+from PIL import Image
+from docx import Document
+import openpyxl
 print('Todas las dependencias críticas están instaladas')
 " || {
     echo "Error en dependencias críticas"
@@ -109,9 +119,18 @@ pyinstaller \
   --hidden-import=soundfile \
   --hidden-import=speech_recognition \
   --hidden-import=pyaudio \
+  --hidden-import=fitz \
+  --hidden-import=PIL \
+  --hidden-import=PIL.Image \
+  --hidden-import=docx \
+  --hidden-import=openpyxl \
   --collect-all chromadb \
   --collect-all sounddevice \
   --collect-all speech_recognition \
+  --collect-all fitz \
+  --collect-all PIL \
+  --collect-all docx \
+  --collect-all openpyxl \
   --osx-bundle-identifier="com.secretaria.SecreIA" \
   run_app.py
 
@@ -165,8 +184,38 @@ cat > "$APP_PATH/Contents/Info.plist" << 'EOF'
     <string>SecreIA requiere captura de audio para procesar y transcribir conversaciones en tiempo real.</string>
     <key>NSSpeechRecognitionUsageDescription</key>
     <string>SecreIA utiliza reconocimiento de voz para transcripción rápida y precisa.</string>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>SecreIA necesita acceso a documentos para procesar archivos adjuntos como PDFs, imágenes y documentos de Office.</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>SecreIA puede acceder a la carpeta de descargas para procesar archivos adjuntos.</string>
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>SecreIA puede acceder a volúmenes externos para procesar archivos adjuntos.</string>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.productivity</string>
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeExtensions</key>
+            <array>
+                <string>pdf</string>
+                <string>doc</string>
+                <string>docx</string>
+                <string>xls</string>
+                <string>xlsx</string>
+                <string>jpg</string>
+                <string>jpeg</string>
+                <string>png</string>
+                <string>gif</string>
+                <string>txt</string>
+            </array>
+            <key>CFBundleTypeName</key>
+            <string>Documentos Soportados</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+        </dict>
+    </array>
 </dict>
 </plist>
 EOF
@@ -191,6 +240,10 @@ cat > entitlements.plist << EOF
     <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
     <true/>
     <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+    <key>com.apple.security.files.downloads.read-write</key>
     <true/>
 </dict>
 </plist>
@@ -226,6 +279,12 @@ cp -R "$APP_PATH" "/Applications/"
 
 # Remover quarantine de la copia instalada
 xattr -rd com.apple.quarantine "/Applications/SecreIA.app" 2>/dev/null || true
+
+echo "Configurando almacenamiento de adjuntos..."
+mkdir -p ~/.secretaria_ai/attachments
+mkdir -p ~/.secretaria_ai/thumbnails
+chmod 755 ~/.secretaria_ai/attachments
+chmod 755 ~/.secretaria_ai/thumbnails
 
 # Registrar aplicación
 echo "Registrando aplicación..."

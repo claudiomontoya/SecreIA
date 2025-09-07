@@ -867,7 +867,7 @@ class AppleButton(QPushButton):
             """,
             "success": f"""
                 QPushButton {{
-                    background-color: {WindowsColors.GREEN.name()};
+                    background-color: #65AB65;
                     color: white;
                     border: none;
                     border-radius: 8px;

@@ -89,8 +89,6 @@ class AIService:
                 "1. RESUMEN EJECUTIVO\n\n"
                 "2. ANÁLISIS DETALLADO\n\n"
                 "3. PUNTOS CLAVE IDENTIFICADOS\n\n"
-                "4. RECOMENDACIONES\n\n"
-                "5. INFORMACIÓN FALTANTE\n\n"
             )
             max_completion_tokens = 2500
         else:
@@ -180,9 +178,6 @@ class AIService:
                 "- EXTRAE insights sobre tolerancias, umbrales, responsabilidades y flujos de trabajo\n"
                 "- IDENTIFICA problemas, soluciones propuestas y configuraciones técnicas\n"
                 "- DESTACA aspectos únicos, no información que cualquiera deduciría del contexto\n\n"
-                "4. RECOMENDACIONES\n"
-                "Acciones sugeridas basadas en el análisis del contenido.\n\n"
-                "5. INFORMACIÓN FALTANTE\n"
                 "Aspectos importantes que no están cubiertos en el contexto proporcionado.\n\n"
             )
             max_completion_tokens = 3500

@@ -67,11 +67,11 @@ class AnalysisWorker(QThread):
         self.k_value = k_value
         
     def run(self):
-        """Ejecuta análisis en hilo separado con streaming"""
+        """Ejecuta análisis en hilo separado con streaming - SOLO VECTORIAL"""
         try:
             self.analysis_progress.emit("Verificando índice vectorial...")
             
-            # VERIFICACIÓN FORZADA DEL VECTOR STORE
+            # VERIFICACIÓN PURAMENTE VECTORIAL
             total_chunks = self.vector.col.count()
             if total_chunks == 0:
                 self.analysis_progress.emit("Reindexando notas existentes...")
@@ -79,22 +79,23 @@ class AnalysisWorker(QThread):
                 total_chunks = self.vector.col.count()
             
             if total_chunks == 0:
-                self.analysis_finished.emit("No hay notas indexadas en el sistema. Crea algunas notas primero.")
+                self.analysis_finished.emit("No hay notas indexadas. Crea y guarda algunas notas primero.")
                 return
             
             self.analysis_progress.emit("Buscando documentos relevantes...")
             retrieved = self.vector.search_optimized(self.question, top_k=self.k_value)
             
             if not retrieved:
-                self.analysis_finished.emit("No se encontraron notas relevantes para responder a tu pregunta.")
+                self.analysis_finished.emit("No se encontraron notas relevantes para tu pregunta.")
                 return
             
             self.analysis_progress.emit(f"Analizando {len(retrieved)} documentos...")
-            note_ids = [int(r["note_id"]) for r in retrieved]
-            contexts = self._load_contexts_batch(note_ids, retrieved)
+            
+            # CONSTRUIR CONTEXTOS SOLO DESDE VECTORIAL
+            contexts = self._build_contexts_from_vectorial(retrieved)
             
             if not contexts:
-                self.analysis_finished.emit("No se pudieron cargar las notas relevantes.")
+                self.analysis_finished.emit("No se pudieron procesar las notas relevantes.")
                 return
             
             self.analysis_progress.emit("Generando análisis con IA...")
@@ -102,6 +103,39 @@ class AnalysisWorker(QThread):
             
         except Exception as e:
             self.analysis_error.emit(f"Error en el análisis: {str(e)}")
+
+    def _build_contexts_from_vectorial(self, retrieved: list) -> list:
+        """Construye contextos EXCLUSIVAMENTE desde datos vectoriales"""
+        try:
+            contexts = []
+            seen_notes = set()
+            
+            for result in retrieved[:self.k_value]:  # Limitar desde el inicio
+                note_id = result.get("note_id")
+                if note_id in seen_notes:
+                    continue
+                seen_notes.add(note_id)
+                
+                title = result.get("title", "Sin título")
+                snippet = result.get("snippet", "")
+                
+                # Limpiar snippet si tiene prefijo
+                content = snippet
+                if content.startswith("Título:"):
+                    lines = content.split("\n", 2)
+                    if len(lines) >= 3:
+                        content = lines[2]
+                
+                contexts.append({
+                    "title": title,
+                    "content": content[:2000]  # Limitar longitud
+                })
+            
+            return contexts
+            
+        except Exception as e:
+            print(f"Error construyendo contextos vectoriales: {e}")
+            return []  # FALTABA RETURN
 
     def _force_reindex(self):
         """Fuerza reindexación de todas las notas desde SQLite hacia vectorial"""
@@ -124,6 +158,7 @@ class AnalysisWorker(QThread):
             
         except Exception as e:
             print(f"❌ Error en reindexación forzada: {e}")
+
     def _generate_streaming_response(self, contexts: list):
         """Genera respuesta con streaming"""
         try:
@@ -151,62 +186,6 @@ class AnalysisWorker(QThread):
             
         except Exception as e:
             self.analysis_error.emit(f"Error generando respuesta: {str(e)}")
-    
-    def _load_contexts_batch(self, note_ids: list, retrieved: list) -> list:
-        """Carga contextos SOLO desde base vectorial - SIN SQLite"""
-        try:
-            # AGRUPAR CHUNKS POR NOTE_ID DESDE RETRIEVED
-            notes_data = {}
-            
-            for result in retrieved:
-                note_id = int(result["note_id"])
-                title = result.get("title", "Sin título")
-                snippet = result.get("snippet", "")
-                
-                if note_id not in notes_data:
-                    notes_data[note_id] = {
-                        "title": title,
-                        "chunks": [],
-                        "score": result.get("score", 0)
-                    }
-                
-                # Limpiar snippet si tiene prefijo de título
-                content = snippet
-                if content.startswith("Título:"):
-                    lines = content.split("\n", 2)
-                    if len(lines) >= 3:
-                        content = lines[2]
-                
-                notes_data[note_id]["chunks"].append({
-                    "content": content,
-                    "score": result.get("score", 0)
-                })
-            
-            # RECONSTRUIR CONTEXTOS DESDE CHUNKS AGRUPADOS
-            contexts = []
-            for note_id in note_ids:
-                if note_id in notes_data:
-                    note_data = notes_data[note_id]
-                    
-                    # Combinar chunks de la misma nota
-                    chunk_contents = [chunk["content"] for chunk in note_data["chunks"]]
-                    combined_content = " ".join(chunk_contents)
-                    
-                    # Limitar contenido por tokens aproximados
-                    max_content_chars = min(3000, len(combined_content))
-                    final_content = combined_content[:max_content_chars]
-                    
-                    contexts.append({
-                        "title": note_data["title"],
-                        "content": final_content
-                    })
-            
-            return contexts[:5]  # Limitar a top 5
-            
-        except Exception as e:
-            print(f"Error cargando contextos desde vectorial: {e}")
-            return []
-
 class SummaryWorker(QThread):
     """Worker thread para resumen con streaming"""
     
@@ -1208,8 +1187,8 @@ class AppleButton(QPushButton):
             """,
             "success": f"""
                 QPushButton {{
-                    background-color: {AppleColors.GREEN.name()};
-                    color: white;
+                    background-color: #65ab65;
+                    color: #ffffff;
                     border: none;
                     border-radius: 8px;
                     padding: 10px 20px;
@@ -1218,10 +1197,11 @@ class AppleButton(QPushButton):
                     font-weight: 500;
                 }}
                 QPushButton:hover {{
-                    background-color: {AppleColors.GREEN.darker(110).name()};
+                    background-color: #4d8c4d;
                 }}
                 QPushButton:disabled {{
-                    background-color: {AppleColors.TERTIARY.name()};
+                   background-color: #a8cfa8;   
+                   color: #f0f0f0;
                 }}
             """,
             "danger": f"""
@@ -2637,7 +2617,7 @@ class EnhancedTranscribeTab(QWidget):
             # Actualizar UI si ya existe
             if hasattr(self, 'status_info'):
                 self.status_info.setText("✅ listo para transcripción")
-                self.status_info.setStyleSheet("color: green; font-weight: 500; border: none;")
+                self.status_info.setStyleSheet("color: #65AB65; font-weight: 500; border: none;")
             if hasattr(self, 'btn_start'):
                 self.btn_start.setEnabled(True)
             if hasattr(self, 'status_label'):
@@ -4096,7 +4076,12 @@ class AnalyzeTab(QWidget):
                 pyperclip.copy(text)
                 QMessageBox.information(self, "Copiado", "Respuesta copiada al portapapeles")
         except ImportError:
-            QMessageBox.warning(self, "Error", "pyperclip no está disponible")
+            # Fallback si pyperclip no está disponible
+            clipboard = QApplication.clipboard()
+            clipboard.setText(text)
+            QMessageBox.information(self, "Copiado", "Respuesta copiada al portapapeles")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"No se pudo copiar: {e}")
 
     def ask(self):
         if not self.vector:
@@ -4121,7 +4106,7 @@ class AnalyzeTab(QWidget):
         self.analysis_worker.analysis_finished.connect(self._on_analysis_finished)
         self.analysis_worker.analysis_error.connect(self._on_analysis_error)
         self.analysis_worker.analysis_progress.connect(self._on_analysis_progress)
-        self.analysis_worker.analysis_streaming.connect(self._on_analysis_streaming)  # NUEVO
+        self.analysis_worker.analysis_streaming.connect(self._on_analysis_streaming)
         
         # Iniciar análisis en hilo separado
         self.analysis_worker.start()
@@ -4161,13 +4146,13 @@ class AnalyzeTab(QWidget):
     def _on_analysis_finished(self, response: str):
         """Maneja finalización exitosa"""
         # Solo actualizar con fuentes si no se recibió por streaming
-        if "📚 Fuentes consultadas:" not in self.answer.toPlainText():
-            self.answer.setPlainText(response)
-        else:
-            # Ya se recibió por streaming, solo añadir fuentes si faltan
-            current_text = self.answer.toPlainText()
-            if "📚 Fuentes consultadas:" not in current_text:
-                # Extraer solo la parte de fuentes de la respuesta
+        current_text = self.answer.toPlainText()
+        if "📚 Fuentes consultadas:" not in current_text:
+            # Si no hay streaming text, usar respuesta completa
+            if not current_text or current_text.startswith("🔄"):
+                self.answer.setPlainText(response)
+            else:
+                # Hay streaming text, solo añadir fuentes
                 if "📚 Fuentes consultadas:" in response:
                     sources_part = response[response.find("📚 Fuentes consultadas:"):]
                     self.answer.setPlainText(current_text + "\n\n" + sources_part)
@@ -4176,8 +4161,9 @@ class AnalyzeTab(QWidget):
 
     def _on_analysis_error(self, error: str):
         """Maneja errores de análisis"""
-        QMessageBox.critical(self, "Error", error)
+        self.answer.clear()
         self.answer.setPlaceholderText("❌ Error en el análisis")
+        QMessageBox.critical(self, "Error", error)
         self._reset_analysis_ui()
 
     def _reset_analysis_ui(self):
@@ -4188,7 +4174,6 @@ class AnalyzeTab(QWidget):
         # Limpiar worker
         if hasattr(self, 'analysis_worker'):
             self.analysis_worker.deleteLater()
-
 class SettingsTab(QWidget):
     """Tab de configuraciones estilo Apple - MEJORADO"""
     
@@ -5178,7 +5163,7 @@ class DashboardTab(QWidget):
             }}
         """)
         
-        new_note_action = AppleButton("+ Nueva nota", "primary")
+        new_note_action = AppleButton("+ Nueva nota", "success")
         new_note_action.clicked.connect(lambda: self._switch_tab(1))
         
         notes_header.addWidget(recent_label)
@@ -5331,20 +5316,24 @@ class SideNav(QWidget):
                 border: none;
                 outline: none;
                 font-family: '.AppleSystemUIFont';
-                font-size: 14px;
+                font-size: 18px;
             }}
             QListWidget::item {{
                 color: {AppleColors.PRIMARY.name()};
                 padding: 10px 16px;
                 border-radius: 8px;
-                margin: 2px 0px;
+                margin: 3px 0px;
+                font-size: 20px;
+                font-weight: 700;
             }}
             QListWidget::item:hover {{
-                background-color: {AppleColors.CARD.name()};
+                background-color: rgba(255,255,255,0.06);
             }}
             QListWidget::item:selected {{
                 background-color: {AppleColors.BLUE.name()};
                 color: white;
+                font-size: 24px;
+                font-weight: 700;
             }}
         """)
         
@@ -5377,6 +5366,7 @@ class SideNav(QWidget):
             self.on_change_index(row)
     
     # ELIMINAR método update_connection_status completamente
+
 class MainWindow(QMainWindow):
     """Ventana principal con diseño Apple - MEJORADA"""
     

@@ -80,8 +80,6 @@ class AIService:
                 "1. RESUMEN EJECUTIVO\n\n"
                 "2. ANÁLISIS DETALLADO\n\n"
                 "3. PUNTOS CLAVE IDENTIFICADOS\n\n"
-                "4. RECOMENDACIONES\n\n"
-                "5. INFORMACIÓN FALTANTE\n\n"
             )
             max_tokens = 2500
         else:

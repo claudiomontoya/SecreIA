@@ -268,3 +268,4 @@ class NotesDB:
                 )
                 for r in rows
             ]
+            
