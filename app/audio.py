@@ -9,43 +9,6 @@ import numpy as np
 import sounddevice as sd
 import soundfile as sf
 
-class AudioQualityAnalyzer:
-    """Analiza calidad de audio en tiempo real - SIMPLIFICADO"""
-    
-    def __init__(self):
-        self.volume_history = []
-        self.silence_threshold = 0.01
-        self.noise_threshold = 0.8
-    
-    def analyze_chunk(self, audio_data: np.ndarray) -> Dict[str, Any]:
-        """Analiza un chunk de audio y devuelve métricas básicas"""
-        if len(audio_data) == 0:
-            return {"volume": 0, "quality": "silent"}
-        
-        # Convertir a float si es necesario
-        if audio_data.dtype != np.float32:
-            audio_data = audio_data.astype(np.float32) / 32768.0
-        
-        # Calcular volumen RMS
-        rms = np.sqrt(np.mean(audio_data ** 2))
-        self.volume_history.append(rms)
-        
-        # Mantener solo últimos 20 chunks
-        if len(self.volume_history) > 20:
-            self.volume_history.pop(0)
-        
-        # Detectar calidad básica
-        if rms < self.silence_threshold:
-            quality = "silent"
-        elif rms > self.noise_threshold:
-            quality = "loud"
-        else:
-            quality = "good"
-        
-        return {
-            "volume": float(rms),
-            "quality": quality
-        }
 
 class SimpleRecorder:
     """Grabador simple solo para respaldo opcional"""
@@ -144,6 +107,3 @@ class SimpleRecorder:
         
         return {'file': self._outfile} if self._outfile else None
 
-# Alias para compatibilidad con el código existente
-AdvancedRecorder = SimpleRecorder
-Recorder = SimpleRecorder

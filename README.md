@@ -97,7 +97,10 @@ cd SecreIA
 
 # Ejecutar script de construcción
 chmod +x build_signed.sh
-./build_mac.sh
+./build_signed.sh
+
+# Opción 2: Instalación limpia (elimina todas las notas y configuraciones)
+./build_signed.sh --clean-db
 ```
 
 El script automáticamente:
@@ -275,6 +278,42 @@ Los logs se guardan en:
 - Configuración: `~/.secretaria_ai/config.json`
 - Base de datos: `~/.secretaria_ai/notes.db`
 
+
+### Próxima refactorización
+
+El proyecto está migrando hacia una arquitectura más modular:
+
+```
+app/
+├── ui/
+│   ├── components/     # AppleButton, AppleCard, LoadingSpinner
+│   ├── tabs/          # DashboardTab, NotesTab, TranscribeTab
+│   ├── dialogs/       # WelcomeScreen, SetupScreen
+│   └── workers/       # AnalysisWorker, SummaryWorker
+├── core/
+│   ├── ai.py          # Servicios de IA
+│   ├── db.py          # Base de datos
+│   ├── vectorstore.py # Búsqueda semántica
+│   └── audio.py       # Pipeline de audio
+├── utils/
+│   ├── exceptions.py  # Excepciones específicas
+│   └── logging.py     # Sistema de logs
+└── main.py            # Punto de entrada (200-300 líneas)
+```
+
+### Mejoras planeadas
+- **Separación de concerns**: UI, lógica de negocio y servicios
+- **Manejo de errores robusto**: Excepciones específicas por módulo  
+- **Sistema de logging**: Trazabilidad completa de operaciones
+- **Tests automatizados**: Cobertura del 80%+ del código crítico
+
+### Áreas que necesitan ayuda
+- **Testing**: Escribir tests unitarios y de integración
+- **Documentación**: Mejorar comentarios en código complejo
+- **UI/UX**: Refinamiento de la interfaz Apple-native
+- **Optimización**: Mejoras de rendimiento en búsqueda vectorial
+- **Accesibilidad**: Soporte VoiceOver y navegación por teclado
+
 ## 📄 Licencia
 
 Este proyecto está licenciado bajo la Licencia MIT. Ver el archivo [LICENSE](LICENSE) para más detalles.
@@ -284,4 +323,8 @@ Este proyecto está licenciado bajo la Licencia MIT. Ver el archivo [LICENSE](LI
 - **Issues**: [GitHub Issues](https://github.com/claudiomontoya/SecreIA/issues)
 - **Discussions**: [GitHub Discussions](https://github.com/claudiomontoya/SecreIA/discussions)
 - **Email**: claudio.montoya@biopc.cl
+
+
+
+
 

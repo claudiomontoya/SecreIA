@@ -1,6 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Configuración por defecto
+CLEAN_DB=false
+
+# Procesar argumentos
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --clean-db)
+            CLEAN_DB=true
+            shift
+            ;;
+        --help)
+            echo "Uso: $0 [--clean-db]"
+            echo "  --clean-db   Eliminar bases de datos existentes"
+            echo "  (sin args)   Conservar bases de datos existentes"
+            exit 0
+            ;;
+        *)
+            echo "Argumento desconocido: $1"
+            echo "Usa --help para ver opciones"
+            exit 1
+            ;;
+    esac
+done
+
 echo "Construyendo SecreIA con firma para macOS..."
 
 # Verificar dependencias del sistema
@@ -46,10 +70,15 @@ fi
 echo "Limpiando archivos de construcción..."
 rm -rf .venv build/ dist/ __pycache__/ app/__pycache__/ *.spec entitlements.plist 2>/dev/null || true
 
-# Limpiar TODAS las bases de datos para evitar desincronización
-echo "Limpiando bases de datos para evitar conflictos..."
-rm -rf ~/.secretaria_ai/chroma/ 2>/dev/null || true
-rm -rf ~/.secretaria_ai/notes.db 2>/dev/null || true
+# Manejo condicional de bases de datos
+if [ "$CLEAN_DB" = true ]; then
+    echo "Limpiando bases de datos existentes..."
+    rm -rf ~/.secretaria_ai/chroma/ 2>/dev/null || true
+    rm -rf ~/.secretaria_ai/notes.db 2>/dev/null || true
+    echo "Bases de datos eliminadas."
+else
+    echo "Conservando bases de datos existentes."
+fi
 
 # Crear entorno virtual
 echo "Creando entorno virtual con Python 3.11..."

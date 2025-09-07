@@ -8,7 +8,6 @@ posthog>=3.0.0
 tqdm>=4.60.0
 requests>=2.25.0
 pyperclip>=1.8.2
-pyautogui>=0.9.54
 packaging>=21.0
 typing-extensions>=4.0.0
 SpeechRecognition>=3.10.0

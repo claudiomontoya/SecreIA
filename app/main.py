@@ -435,21 +435,7 @@ class AppleColors:
     SEPARATOR = QColor(84, 84, 88)        
     SEPARATOR_LIGHT = QColor(58, 58, 60) 
 
-class SafeTimer(QTimer):
-    """Timer con manejo seguro de errores"""
-    def __init__(self, callback, interval=1000, single_shot=True):
-        super().__init__()
-        self.callback = callback
-        self.setSingleShot(single_shot)
-        self.setInterval(interval)
-        self.timeout.connect(self._safe_execute)
         
-    def _safe_execute(self):
-        try:
-            self.callback()
-        except Exception as e:
-            print(f"Error en timer: {e}")
-            
 class LoadingSpinner(QWidget):
     """Spinner de carga estilo Apple"""
     def __init__(self, size=16):
@@ -1034,60 +1020,6 @@ class AdvancedSearchBar(QWidget):
         """Limpia búsqueda"""
         self.search_edit.clear()
         self._emit_search()
-class AudioQualityWidget(QWidget):
-    """Widget para mostrar calidad de audio en tiempo real"""
-    
-    def __init__(self):
-        super().__init__()
-        self._setup_ui()
-        
-    def _setup_ui(self):
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        
-        # Indicador de volumen
-        self.volume_bar = QProgressBar()
-        self.volume_bar.setRange(0, 100)
-        self.volume_bar.setFixedHeight(20)
-        self.volume_bar.setStyleSheet(f"""
-            QProgressBar {{
-                border: 1px solid {AppleColors.SEPARATOR_LIGHT.name()};
-                border-radius: 10px;
-                background-color: {AppleColors.CARD.name()};
-            }}
-            QProgressBar::chunk {{
-                background-color: {AppleColors.GREEN.name()};
-                border-radius: 8px;
-            }}
-        """)
-        
-        # Etiqueta de calidad
-        self.quality_label = QLabel("Sin audio")
-        self.quality_label.setStyleSheet(f"""
-            QLabel {{
-                color: {AppleColors.SECONDARY.name()};
-                font-size: 12px;
-            }}
-        """)
-        
-        layout.addWidget(QLabel("Volumen:"))
-        layout.addWidget(self.volume_bar, 1)
-        layout.addWidget(self.quality_label)
-    
-    def update_quality(self, volume: float, quality: str):
-        """Actualiza indicadores de calidad"""
-        self.volume_bar.setValue(int(volume * 100))
-        
-        color_map = {
-            "good": AppleColors.GREEN.name(),
-            "low": AppleColors.ORANGE.name(),
-            "silent": AppleColors.TERTIARY.name(),
-            "clipping": AppleColors.RED.name()
-        }
-        
-        color = color_map.get(quality, AppleColors.SECONDARY.name())
-        self.quality_label.setText(quality.capitalize())
-        self.quality_label.setStyleSheet(f"QLabel {{ color: {color}; font-size: 12px; }}")
 
 class NotesExportManager:
     """Maneja exportación de notas"""
