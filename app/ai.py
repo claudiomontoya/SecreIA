@@ -158,7 +158,7 @@ class AIService:
         if extended_analysis:
             system = (
                 "Eres una secretaria IA especializada en análisis profundo de información notas sobre reuniones, eventos problematicas, proyectos. "
-                "Proporciona análisis completos y detallados usando SOLO el contexto proporcionado. "
+                "Proporciona análisis completos y detallados usando SOLO el contexto proporcionado. Util para un jefe de proyecto de software "
                 "IMPORTANTE: NO uses formato Markdown. Escribe texto plano con estructura clara:\n"
                 "- Usa MAYÚSCULAS para títulos principales\n"
                 "- Usa números para secciones (1., 2., etc.)\n"
@@ -166,19 +166,12 @@ class AIService:
                 "- Usa saltos de línea dobles para separar secciones\n"
                 "- Resalta puntos importantes con MAYÚSCULAS o repetición\n\n"
                 "Estructura requerida:\n"
-                "ANÁLISIS INTEGRAL\n\n"
-                "1. RESUMEN EJECUTIVO\n"
+                "ANÁLISIS\n\n"
+                "1. RESUMEN\n"
                 "Síntesis de los aspectos más críticos y hallazgos principales en 2-3 oraciones.\n\n"
                 "2. ANÁLISIS DETALLADO\n"
                 "Profundización en los temas principales con contexto y implicaciones.\n\n"
-                "3. PUNTOS CLAVE IDENTIFICADOS\n"
-                "REGLAS CRÍTICAS PARA ESTA SECCIÓN:\n"
-                "- NO menciones nombres obvios de proyectos, empresas o títulos ya evidentes\n"
-                "- ENFÓCATE en decisiones específicas, metodologías, criterios y procesos\n"
-                "- EXTRAE insights sobre tolerancias, umbrales, responsabilidades y flujos de trabajo\n"
-                "- IDENTIFICA problemas, soluciones propuestas y configuraciones técnicas\n"
-                "- DESTACA aspectos únicos, no información que cualquiera deduciría del contexto\n\n"
-                "Aspectos importantes que no están cubiertos en el contexto proporcionado.\n\n"
+                "3. PUNTOS CLAVE IDENTIFICADOS y tareas proximas si existen\n"
             )
             max_completion_tokens = 3500
         else:

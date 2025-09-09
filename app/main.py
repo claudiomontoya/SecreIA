@@ -524,19 +524,6 @@ class SummaryTab(QWidget):
         layout.setSpacing(32)
         layout.setContentsMargins(60, 60, 60, 60)
         
-        # Header
-        header = QLabel("Resumen IA")
-        header.setStyleSheet(f"""
-            QLabel {{
-                color: {AppleColors.PRIMARY.name()};
-                font-family: '.AppleSystemUIFont';
-                font-size: 32px;
-                font-weight: 300;
-            }}
-        """)
-        header.setAlignment(Qt.AlignCenter)
-        layout.addWidget(header)
-        
         # Descripción
         description = QLabel("Genera un resumen inteligente de tus notas de los últimos 3 días con síntesis de voz")
         description.setStyleSheet(f"""
@@ -2506,13 +2493,10 @@ class TranscriptionWorker(QThread):
             self.error.emit(str(e))
 
 class EnhancedTranscribeTab(QWidget):
-    """Tab de transcripción en tiempo real con configuración profesional y manejo robusto de errores"""
-    
-    # Señales thread-safe para comunicación entre hilos
     text_received = Signal(str)
     status_changed = Signal(str)
     error_occurred = Signal(str)
-    
+    note_saved = Signal()
     def __init__(self, settings: 'Settings', db: 'NotesDB', vector: Optional['VectorIndex'], ai: 'AIService'):
         super().__init__()
         self.settings = settings
@@ -2520,7 +2504,6 @@ class EnhancedTranscribeTab(QWidget):
         self.vector = vector
         self.ai = ai
         
-        # Reconocimiento
         self.speech_recognizer = sr.Recognizer()
         self.microphone = None
         self.recognition_thread = None
@@ -2529,38 +2512,146 @@ class EnhancedTranscribeTab(QWidget):
         self.recognition_working = False
         self.is_transcribing = False
         self.start_time = None
-        
-        # Buffer para texto en tiempo real
         self.text_buffer = []
         self.last_update_time = 0
-        self.update_interval = 0.12  # UI ~120ms
-        
-        # --- Pipeline de audio y reconocimiento ---
-        self.audio_queue: "queue.Queue[sr.AudioData]" = queue.Queue(maxsize=12)
-        self.executor = ThreadPoolExecutor(max_workers=3)  # 2-3 workers es buen balance
-        self.capture_thread: Optional[threading.Thread] = None
+        self.update_interval = 0.12
+        self.speaker_history = []
+        self.last_speaker_time = 0
+        self.speaker_threshold = 3.0
+        self.voice_profiles = []
+        self.current_voice_features = None
+        self.vad = None
+        self.vad_available = self._init_webrtc_vad()
+        self.audio_queue = queue.Queue(maxsize=12)
+        self.executor = ThreadPoolExecutor(max_workers=3)
+        self.capture_thread = None
         self.stop_event = threading.Event()
-        self._overlap_buffer = deque(maxlen=1)  # reservado para futuro streaming
-        self.recent_texts = []  # para deduplicación rápida
-        
+        self._overlap_buffer = deque(maxlen=1)
+        self.recent_texts = []
+        self.final_buffer = []
+        self.last_activity_time = 0
+        self._emergency_audio_buffer = []
         self._setup_ui()
         self._connect_signals()
         self._test_speech_recognition()
     
-    # ------------------------------------------------------------------
-    # Señales
-    # ------------------------------------------------------------------
+    def _init_webrtc_vad(self):
+        try:
+            import webrtcvad
+            self.vad = webrtcvad.Vad(2)
+            return True
+        except ImportError:
+            return False
+        except Exception:
+            return False
+    
+    def _setup_ui(self):
+        BG_CARD = "#2a2a2e"; BG_INPUT = "#1c1c1e"; BORDER = "#3a3a3c"; TEXT = "#e5e5e7"; ACCENT = "#0a84ff"
+
+        root = QVBoxLayout(self); root.setSpacing(16); root.setContentsMargins(20, 20, 20, 20)
+
+
+        controls = QHBoxLayout()
+        self.status_label = QLabel("Listo")
+        self.status_label.setStyleSheet(f"color:{TEXT};font-size:12px;")
+        controls.addWidget(self.status_label, 1, Qt.AlignLeft)
+
+        def style_btn(b: QPushButton):
+            b.setMinimumHeight(36)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setStyleSheet(f"""
+                QPushButton {{background:{BG_CARD};color:{TEXT};border:1px solid {BORDER};
+                border-radius:10px;padding:8px 16px;}}
+                QPushButton:hover {{border-color:{ACCENT};}}
+                QPushButton:disabled {{color:#8e8e93;background:#2b2b2f;border-color:#2f2f33;}}
+            """)
+
+        self.btn_start = QPushButton("🟢 Iniciar"); style_btn(self.btn_start)
+        self.btn_stop  = QPushButton("⏹️ Detener"); self.btn_stop.setEnabled(False); 
+        self.btn_stop.setStyleSheet(f"""
+            QPushButton {{background:#ff453a;color:white;border:1px solid #ff453a;
+            border-radius:10px;padding:8px 16px;}}
+            QPushButton:hover {{background:#ff6961;}}
+            QPushButton:disabled {{color:#8e8e93;background:#2b2b2f;border-color:#2f2f33;}}
+        """)
+        self.btn_config = QPushButton("🔧 Configuración"); style_btn(self.btn_config)
+
+        self.btn_start.clicked.connect(self.start_transcription)
+        self.btn_stop.clicked.connect(self.stop_transcription)
+        self.btn_config.clicked.connect(self._open_transcribe_settings)
+
+        controls.addWidget(self.btn_start); controls.addWidget(self.btn_stop); controls.addWidget(self.btn_config)
+        root.addLayout(controls)
+
+        form = QGridLayout(); form.setHorizontalSpacing(12); form.setVerticalSpacing(8)
+        label_style = f"color:{TEXT};font-size:13px;"
+        input_css = f"border:1px solid {BORDER};border-radius:8px;padding:6px 10px;background:{BG_INPUT};color:{TEXT};min-height:34px;"
+
+        def mk_lbl(t): l=QLabel(t); l.setStyleSheet(label_style); return l
+
+        form.addWidget(mk_lbl("Título:"), 0, 0)
+        self.title_edit = QLineEdit(); self.title_edit.setPlaceholderText("Título de la transcripción")
+        self.title_edit.setStyleSheet(f"QLineEdit{{{input_css}}} QLineEdit:focus{{border-color:{ACCENT};}}")
+        form.addWidget(self.title_edit, 0, 1, 1, 2)
+
+        form.addWidget(mk_lbl("Categoría:"), 1, 0)
+        self.category_combo = QComboBox()
+        self.category_combo.setStyleSheet(f"""
+            QComboBox{{{input_css}}}
+            QComboBox::drop-down{{width:28px;border:none;}}
+            QComboBox QAbstractItemView{{background:{BG_INPUT};color:{TEXT};
+                selection-background-color:{ACCENT};border:1px solid {BORDER};}}
+        """)
+        
+        categories = self.db.list_categories()
+        if "Transcripciones" not in categories:
+            categories.insert(0, "Transcripciones")
+        for cat in categories:
+            self.category_combo.addItem(cat)
+        self.category_combo.setCurrentText("Transcripciones")
+        
+        form.addWidget(self.category_combo, 1, 1)
+
+        self.single_speaker_mode = QCheckBox("Un solo hablante")
+        self.single_speaker_mode.setChecked(True)
+        self.single_speaker_mode.setStyleSheet(f"color:{TEXT};")
+        form.addWidget(self.single_speaker_mode, 1, 2, Qt.AlignLeft)
+
+        root.addLayout(form)
+
+        root.addWidget(mk_lbl("Transcripción en vivo"))
+        self.transcript_preview = QTextEdit(); self.transcript_preview.setReadOnly(True)
+        self.transcript_preview.setPlaceholderText("El texto aparecerá aquí mientras hablas...")
+        self.transcript_preview.setStyleSheet(f"""
+            QTextEdit{{background:{BG_INPUT};color:{TEXT};border:1px solid {BORDER};border-radius:10px;
+            padding:8px 10px;font-family:'.AppleSystemUIFont';font-size:14px;}}
+        """)
+        self.transcript_preview.textChanged.connect(self._on_transcript_changed)
+        root.addWidget(self.transcript_preview, 1)
+
+        actions = QHBoxLayout(); actions.addStretch(1)
+        self.btn_save_note = QPushButton("💾 Guardar"); self.btn_save_note.setEnabled(False); style_btn(self.btn_save_note)
+        self.btn_copy = QPushButton("📋 Copiar"); self.btn_copy.setEnabled(False); style_btn(self.btn_copy)
+        self.btn_clear = QPushButton("🗑️ Limpiar"); style_btn(self.btn_clear)
+        self.btn_save_note.clicked.connect(self._save_as_note)
+        self.btn_copy.clicked.connect(self._copy_transcription)
+        self.btn_clear.clicked.connect(self._clear_transcription)
+        actions.addWidget(self.btn_save_note); actions.addWidget(self.btn_copy); actions.addWidget(self.btn_clear)
+        root.addLayout(actions)
+        
+        self.duration_timer = QTimer()
+        self.duration_timer.timeout.connect(self._update_duration)
+        
+        self.ui_update_timer = QTimer()
+        self.ui_update_timer.timeout.connect(self._flush_text_buffer)
+        self.ui_update_timer.setInterval(int(self.update_interval * 1000))
+    
     def _connect_signals(self):
-        """Conecta señales thread-safe"""
         self.text_received.connect(self._handle_text_update)
         self.status_changed.connect(self._handle_status_update)
         self.error_occurred.connect(self._handle_error_update)
         
-    # ------------------------------------------------------------------
-    # Inicialización y test de SR
-    # ------------------------------------------------------------------
     def _test_speech_recognition(self):
-        """Configuración balanceada y estable"""
         if not self._check_and_request_microphone_access():
             self.recognition_working = False
             return
@@ -2568,42 +2659,79 @@ class EnhancedTranscribeTab(QWidget):
         try:
             self.microphone = sr.Microphone()
             with self.microphone as source:
-                # Calibración más larga para mejor estabilidad
                 self.speech_recognizer.adjust_for_ambient_noise(source, duration=0.3)
             
-            # CONFIGURACIÓN BALANCEADA (baja latencia + estabilidad)
             self.speech_recognizer.energy_threshold = max(2500, int(self.speech_recognizer.energy_threshold))
-            self.speech_recognizer.pause_threshold = 0.5
+            self.speech_recognizer.pause_threshold = 0.8
             self.speech_recognizer.phrase_threshold = 0.25
             self.speech_recognizer.dynamic_energy_threshold = True
             self.speech_recognizer.dynamic_energy_adjustment_damping = 0.12
             self.speech_recognizer.dynamic_energy_ratio = 1.4
             self.speech_recognizer.operation_timeout = None
-            self.speech_recognizer.non_speaking_duration = 0.3
+            self.speech_recognizer.non_speaking_duration = 0.6
             
             self.recognition_working = True
-            print("Reconocimiento configurado de forma balanceada y estable")
-
-            # Actualizar UI si ya existe
-            if hasattr(self, 'status_info'):
-                self.status_info.setText("✅ listo para transcripción")
-                self.status_info.setStyleSheet("color: #65AB65; font-weight: 500; border: none;")
-            if hasattr(self, 'btn_start'):
-                self.btn_start.setEnabled(True)
-            if hasattr(self, 'status_label'):
-                self.status_label.setText("Listo - Configuración estable activa")
+            self.btn_start.setEnabled(True)
+            self.status_label.setText("Listo - Configuración estable activa")
                 
         except Exception as e:
-            print(f"Error configurando reconocimiento: {e}")
             self.microphone = None
             self.recognition_working = False
             QTimer.singleShot(500, self._show_permission_guide)
 
-    # ------------------------------------------------------------------
-    # Pipeline captura + reconocimiento
-    # ------------------------------------------------------------------
+    def start_transcription(self):
+        if not self.recognition_working:
+            QMessageBox.warning(self, APP_NAME, "El reconocimiento de voz no está disponible.")
+            return
+        
+        try:
+            self._configure_microphone_for_fast_speech()
+            
+            self.is_transcribing = True
+            self.recognition_active = True
+            self.start_time = time.time()
+            self.last_activity_time = time.time()
+            self.realtime_text = []
+            self.text_buffer = []
+            self.final_buffer = []
+            self.recent_texts = []
+            self.speaker_history = []
+            self.last_speaker_time = 0
+            self.voice_profiles = []
+            self.current_voice_features = None
+            
+            self.btn_start.setEnabled(False)
+            self.btn_stop.setEnabled(True)
+            
+            self.status_label.setText("🔴 Transcribiendo...")
+            
+            self.transcript_preview.clear()
+            vad_info = " (VAD activo)" if self.vad_available else ""
+            self.transcript_preview.append(f"🎤 Transcripción activa{vad_info}...\n")
+            
+            self._start_realtime_recognition()
+            
+            self.duration_timer.start(1000)
+            self.ui_update_timer.setInterval(int(self.update_interval * 1000))
+            self.ui_update_timer.start()
+            
+            self.periodic_flush_timer = QTimer()
+            self.periodic_flush_timer.timeout.connect(self._periodic_flush_and_check)
+            self.periodic_flush_timer.start(1500)
+                        
+        except Exception as e:
+            QMessageBox.warning(self, APP_NAME, f"No se pudo iniciar la transcripción: {e}")
+            self._reset_state()
+
+    def stop_transcription(self):
+        if not self.is_transcribing:
+            return
+
+        self.recognition_active = False
+        # CAMBIO: Dar más tiempo para capturar últimos audios
+        QTimer.singleShot(2000, self._finish_transcription_cleanup)  # 800ms -> 2000ms
+    
     def _start_realtime_recognition(self):
-        """Inicia pipeline de captura + reconocimiento concurrente."""
         if not self.microphone:
             try:
                 self.microphone = sr.Microphone()
@@ -2611,279 +2739,563 @@ class EnhancedTranscribeTab(QWidget):
                 self.error_occurred.emit(f"No hay micrófono: {e}")
                 return
 
-        # Reset de estado
         with self.audio_queue.mutex:
             self.audio_queue.queue.clear()
         self.stop_event.clear()
 
-        # Hilo de captura: rápido y continuo
         def _capture_loop():
             try:
                 with self.microphone as source:
-                    # Captura sensible y con baja latencia
-                    self.speech_recognizer.pause_threshold = 0.5
+                    self.speech_recognizer.pause_threshold = 0.8
                     self.speech_recognizer.phrase_threshold = 0.25
-                    self.speech_recognizer.non_speaking_duration = 0.3
-                    phrase_time_limit = 3.0  # chunks cortos
+                    self.speech_recognizer.non_speaking_duration = 0.6
+                    phrase_time_limit = 4.0
 
                     while self.recognition_active and not self.stop_event.is_set():
                         try:
                             audio = self.speech_recognizer.listen(
                                 source,
-                                timeout=1.0,
+                                timeout=1.5,
                                 phrase_time_limit=phrase_time_limit
                             )
-                            # Encolar sin bloquear; si lleno, descartamos el más viejo
+                            
+                            audio_timestamp = time.time()
+                            self.last_activity_time = audio_timestamp
+                            
+                            # CAMBIO: Manejo más agresivo de cola llena
                             try:
-                                self.audio_queue.put_nowait(audio)
+                                self.audio_queue.put_nowait((audio, audio_timestamp))
                             except queue.Full:
+                                # Eliminar hasta 3 elementos antiguos para hacer espacio
+                                for _ in range(3):
+                                    try:
+                                        _ = self.audio_queue.get_nowait()
+                                    except queue.Empty:
+                                        break
                                 try:
-                                    _ = self.audio_queue.get_nowait()
-                                except queue.Empty:
-                                    pass
-                                try:
-                                    self.audio_queue.put_nowait(audio)
+                                    self.audio_queue.put_nowait((audio, audio_timestamp))
                                 except queue.Full:
-                                    pass
+                                    # Solo como último recurso, guardar en buffer de emergencia
+                                    if not hasattr(self, '_emergency_audio_buffer'):
+                                        self._emergency_audio_buffer = []
+                                    self._emergency_audio_buffer.append((audio, audio_timestamp))
+                                    print("Audio guardado en buffer de emergencia")
                         except Exception:
-                            # WaitTimeoutError u otros: continuar
                             continue
             except Exception as e:
                 self.error_occurred.emit(f"Error de captura: {e}")
-
-        # Consumidor: programa reconocimiento en pool
         def _consume_loop():
             while self.recognition_active and not self.stop_event.is_set():
                 try:
-                    audio = self.audio_queue.get(timeout=0.3)
+                    audio_data = self.audio_queue.get(timeout=0.5)
+                    audio, timestamp = audio_data
                 except queue.Empty:
+                    if time.time() - self.last_activity_time > 3.0:
+                        self._process_final_buffer()
                     continue
 
-                def _work(audio_chunk: sr.AudioData):
-                    # Reconoce con es-CL y fallback multi-idioma + deduplicación
+                def _work(audio_chunk, chunk_timestamp):
                     try:
                         text = self.speech_recognizer.recognize_google(audio_chunk, language='es-CL')
                         if not text or not text.strip():
-                            return ""
-                        # deduplicación rápida
-                        text_dedup = self._recognize_with_deduplication(audio_chunk)
-                        return text_dedup or text
+                            return None
+                        
+                        voice_features = {}
+                        try:
+                            if self.vad_available:
+                                voice_features = self._analyze_voice_activity(audio_chunk)
+                        except Exception:
+                            voice_features = {"vad_available": False}
+                        
+                        return {
+                            "text": text.strip(),
+                            "voice_features": voice_features,
+                            "timestamp": chunk_timestamp,
+                            "processing_time": time.time()
+                        }
+                        
                     except Exception:
                         try:
-                            return self._recognize_with_multiple_languages(audio_chunk)
+                            backup_text = self._recognize_with_multiple_languages(audio_chunk)
+                            if backup_text:
+                                return {
+                                    "text": backup_text.strip(),
+                                    "voice_features": {"vad_available": False},
+                                    "timestamp": chunk_timestamp,
+                                    "processing_time": time.time(),
+                                    "backup_recognition": True
+                                }
                         except Exception:
-                            return ""
-
-                future: Future = self.executor.submit(_work, audio)
-                def _on_done(fut: Future):
+                            pass
+                    return None
+                    
+                future = self.executor.submit(_work, audio, timestamp)
+                
+                def _on_done(fut):
                     try:
-                        text = fut.result()
-                        if text and isinstance(text, str) and text.strip():
-                            self.realtime_text.append(text.strip())
-                            self.text_received.emit(text.strip())
+                        result = fut.result()
+                        if result:
+                            self.final_buffer.append(result)
+                            
+                            text = result.get("text", "")
+                            if text:
+                                self.realtime_text.append(text)
+                                self.text_received.emit(json.dumps(result))
                     except Exception as e:
-                        self.error_occurred.emit(f"Error worker: {e}")
-
+                        print(f"Error en callback: {e}")
+                        
                 future.add_done_callback(_on_done)
 
-        # Lanzar hilos
         self.capture_thread = threading.Thread(target=_capture_loop, daemon=True)
         self.recognition_thread = threading.Thread(target=_consume_loop, daemon=True)
         self.capture_thread.start()
         self.recognition_thread.start()
 
-    # ------------------------------------------------------------------
-    # Control de transcripción
-    # ------------------------------------------------------------------
-    def start_transcription(self):
-        """Inicia transcripción con configuración profesional"""
-        if not self.recognition_working:
-            QMessageBox.warning(self, APP_NAME, "El reconocimiento de voz no está disponible.\nVerifica tu micrófono y permisos del sistema.")
+    def _periodic_flush_and_check(self):
+        try:
+            self._flush_text_buffer()
+            
+            silence_duration = time.time() - self.last_activity_time
+            
+            if silence_duration > 4.0 and self.final_buffer:
+                self._process_final_buffer()
+                
+            if self.is_transcribing:
+                word_count = len(" ".join(self.realtime_text).split())
+                self.status_label.setText(f"🔴 Transcribiendo... ({word_count} palabras)")
+                
+        except Exception as e:
+            print(f"Error en flush periódico: {e}")
+
+    def _process_final_buffer(self):
+        if not self.final_buffer:
             return
         
         try:
-            # Configuración adicional profesional
-            self._configure_microphone_for_fast_speech()
+            recent_results = []
+            current_time = time.time()
             
-            # Configurar estado
-            self.is_transcribing = True
-            self.recognition_active = True
-            self.start_time = time.time()
-            self.realtime_text = []
-            self.text_buffer = []
-            self.recent_texts = []  # Para deduplicación
+            for item in self.final_buffer:
+                # Manejar tanto diccionarios como strings
+                if isinstance(item, dict):
+                    processing_time = item.get("processing_time", current_time)
+                    if current_time - processing_time < 8.0:  # CAMBIO: 5.0 -> 8.0 segundos
+                        recent_results.append(item)
+                elif isinstance(item, str) and item.strip():
+                    recent_results.append({
+                        "text": item.strip(),
+                        "processing_time": current_time - 1.0
+                    })
             
-            # Actualizar UI
-            self.btn_start.hide()
-            self.btn_stop.show()
-            self.btn_stop.setEnabled(True)
+            if recent_results:
+                final_texts = []
+                existing_texts = [t for t in self.realtime_text[-8:]] if self.realtime_text else []  # CAMBIO: -5 -> -8
+                
+                for result in recent_results:
+                    text = result.get("text", "") if isinstance(result, dict) else str(result)
+                    if text and text not in existing_texts:
+                        final_texts.append(text)
+                
+                if final_texts:
+                    consolidated = " ".join(final_texts)
+                    formatted_text = self._detect_speaker_changes_with_vad(consolidated, {})
+                    self.text_buffer.append(formatted_text)
+                    QTimer.singleShot(100, self._flush_text_buffer)
             
-            self.status_indicator.setText("Transcripción")
-            self.status_indicator.setStyleSheet(f"""
-                QLabel {{
-                    color: white;
-                    font-size: 12px;
-                    border: none;
-                    padding: 4px 8px;
-                    background-color: {AppleColors.GREEN.name()};
-                    border-radius: 4px;
-                }}
-            """)
+            # CAMBIO: No limpiar buffer inmediatamente, solo marcar como procesado
+            for item in self.final_buffer:
+                if isinstance(item, dict):
+                    item["processed"] = True
             
-            # Limpiar vista previa
-            self.transcript_preview.clear()
-            self.transcript_preview.append("🎤 Transcripción activa...\n")
-            
-            # Iniciar pipeline
-            self._start_realtime_recognition()
-            
-            # Timers optimizados
-            self.duration_timer.start(1000)
-            self.ui_update_timer.setInterval(int(self.update_interval * 1000))
-            self.ui_update_timer.start()
+            # Limpiar solo items procesados hace más de 10 segundos
+            current_time = time.time()
+            self.final_buffer = [
+                item for item in self.final_buffer 
+                if not (isinstance(item, dict) and item.get("processed") and 
+                    current_time - item.get("processing_time", 0) > 10.0)
+            ]
             
         except Exception as e:
-            QMessageBox.warning(self, APP_NAME, f"No se pudo iniciar la transcripción: {e}")
-            self._reset_state()
-
-    def stop_transcription(self):
-        """Detiene la transcripción sin perder texto pendiente."""
-        if not self.is_transcribing:
-            return
-
-        # Señal de stop para todos
-        self.recognition_active = False
+            print(f"Error procesando buffer final: {e}")
+            # NO limpiar en caso de error, mantener para reintento
+    def _finish_transcription_cleanup(self):
         self.stop_event.set()
 
-        # Esperar hilos
-        if self.capture_thread and self.capture_thread.is_alive():
-            self.capture_thread.join(timeout=1.5)
-        if self.recognition_thread and self.recognition_thread.is_alive():
-            self.recognition_thread.join(timeout=2.0)
+        # 1. Procesar buffer de emergencia si existe
+        emergency_audio = getattr(self, '_emergency_audio_buffer', [])
+        
+        # 2. Procesar TODO el audio restante en queue
+        remaining_audio = []
+        try:
+            while True:
+                audio_data = self.audio_queue.get_nowait()
+                remaining_audio.append(audio_data)
+        except queue.Empty:
+            pass
+        
+        # Combinar audio de emergencia con el restante
+        all_remaining = emergency_audio + remaining_audio
+        
+        # 3. Procesar audio restante con más tiempo y tolerancia a errores
+        for audio, timestamp in all_remaining:
+            try:
+                text = self.speech_recognizer.recognize_google(audio, language='es-CL')
+                if text and text.strip():
+                    formatted_text = self._detect_speaker_changes_with_vad(text, {})
+                    self.text_buffer.append(formatted_text)
+                    self.realtime_text.append(text)
+            except Exception:
+                # Intentar con backup
+                try:
+                    backup_text = self._recognize_with_multiple_languages(audio)
+                    if backup_text:
+                        self.text_buffer.append(f"\n{backup_text}")
+                        self.realtime_text.append(backup_text)
+                except Exception:
+                    pass
 
-        # No drenamos la cola para cierre rápido; el buffer de texto ya se flushea en UI
-        self.is_transcribing = False
-
-        # Detener timers
-        if hasattr(self, 'ui_update_timer'):
-            self.ui_update_timer.stop()
-
-        # Último flush del buffer a la UI
+        # 4. Procesar buffer final una vez más
+        self._process_final_buffer()
+        
+        # 5. Flush final del texto
         self._flush_text_buffer()
 
-        self._reset_state()
-
-        total_words = len(" ".join(self.realtime_text).split())
-        self.status_label.setText(f"Transcripción completada - {total_words} palabras")
-
-    # ------------------------------------------------------------------
-    # Utilidades de reconocimiento
-    # ------------------------------------------------------------------
-    def _is_duplicate_text(self, new_text: str) -> bool:
-        """Verificación simple de duplicados contra el último fragmento."""
-        if not self.realtime_text:
-            return False
+        # 6. Esperar threads con timeout más generoso
+        if self.capture_thread and self.capture_thread.is_alive():
+            self.capture_thread.join(timeout=5.0)  # CAMBIO: 1.5 -> 5.0
+        if self.recognition_thread and self.recognition_thread.is_alive():
+            self.recognition_thread.join(timeout=5.0)  # CAMBIO: 2.0 -> 5.0
         
-        last_text = self.realtime_text[-1] if self.realtime_text else ""
-        if len(new_text) > 0 and len(last_text) > 0:
-            s1 = set(new_text.lower().split())
-            s2 = set(last_text.lower().split())
-            if not s1 or not s2:
-                return False
-            similarity = len(s1 & s2) / max(len(s1), len(s2))
-            return similarity > 0.8
-        return False
+        # 7. NUEVO: Esperar ThreadPoolExecutor
+        try:
+            self.executor.shutdown(wait=True)
+            # Dar tiempo adicional para trabajos pendientes
+            import concurrent.futures
+            try:
+                # Esperar hasta 8 segundos por trabajos pendientes
+                self.executor = ThreadPoolExecutor(max_workers=3)  # Recrear para próxima vez
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"Error cerrando executor: {e}")
 
-    def _recognize_with_multiple_languages(self, audio):
-        """Reconocimiento con múltiples idiomas para mayor precisión (fallback)."""
-        language_configs = [
-            ('es-CL', False),
-            ('es-419', False),
-            ('es-AR', False),
-            ('es-MX', False),
-            ('es-ES', False),
+        # 8. Limpiar buffer de emergencia
+        if hasattr(self, '_emergency_audio_buffer'):
+            delattr(self, '_emergency_audio_buffer')
+
+        self.is_transcribing = False
+
+        if hasattr(self, 'ui_update_timer'):
+            self.ui_update_timer.stop()
+        if hasattr(self, 'periodic_flush_timer'):
+            self.periodic_flush_timer.stop()
+
+        self._reset_state()
+        self._auto_generate_title()
+
+        total_words = len(self._clean_content(self.transcript_preview.toPlainText()).split())
+        self.status_label.setText(f"✅ Transcripción completada - {total_words} palabras")
+    
+    def _analyze_voice_activity(self, audio_data):
+        try:
+            import numpy as np
+            
+            raw_data = audio_data.get_raw_data()
+            audio_array = np.frombuffer(raw_data, dtype=np.int16)
+            
+            energy = np.sqrt(np.mean(audio_array**2))
+            zero_crossings = len(np.where(np.diff(np.signbit(audio_array)))[0])
+            duration = len(audio_array) / audio_data.sample_rate
+            
+            vad_frames = []
+            speech_ratio = 0.0
+            
+            if self.vad_available and audio_data.sample_rate == 16000:
+                try:
+                    frame_duration = 30
+                    samples_per_frame = int(audio_data.sample_rate * frame_duration / 1000)
+                    
+                    for i in range(0, len(audio_array), samples_per_frame):
+                        frame = audio_array[i:i+samples_per_frame]
+                        if len(frame) == samples_per_frame:
+                            frame_bytes = frame.tobytes()
+                            is_speech = self.vad.is_speech(frame_bytes, audio_data.sample_rate)
+                            vad_frames.append(is_speech)
+                    
+                    if vad_frames:
+                        speech_ratio = sum(vad_frames) / len(vad_frames)
+                        
+                except Exception:
+                    pass
+            
+            dominant_freq = 0.0
+            try:
+                fft = np.fft.fft(audio_array)
+                freqs = np.fft.fftfreq(len(audio_array), 1/audio_data.sample_rate)
+                positive_freqs = freqs[:len(freqs)//2]
+                positive_fft = np.abs(fft[:len(fft)//2])
+                if len(positive_fft) > 0:
+                    dominant_freq = positive_freqs[np.argmax(positive_fft)]
+            except Exception:
+                pass
+            
+            return {
+                "energy": float(energy),
+                "zero_crossings": int(zero_crossings),
+                "dominant_freq": float(abs(dominant_freq)),
+                "duration": float(duration),
+                "speech_ratio": float(speech_ratio),
+                "vad_available": self.vad_available,
+                "total_frames": len(vad_frames),
+                "speech_frames": sum(vad_frames) if vad_frames else 0
+            }
+            
+        except Exception:
+            return {
+                "energy": 0.0, "zero_crossings": 0, "dominant_freq": 0.0,
+                "duration": 0.0, "speech_ratio": 0.0, "vad_available": False,
+                "total_frames": 0, "speech_frames": 0
+            }
+    
+    def _detect_speaker_changes_with_vad(self, text, voice_features):
+        if not text or len(text.strip()) < 2:
+            return text
+        
+        current_time = time.time()
+        current_text = self.transcript_preview.toPlainText()
+        
+        if not current_text or "🎤" in current_text:
+            self.last_speaker_time = current_time
+            self.voice_profiles = [voice_features] if voice_features else []
+            self.current_voice_features = voice_features
+            return f"\n\n👤 Usuario 1:\n{text}"
+        
+        if hasattr(self, 'single_speaker_mode') and self.single_speaker_mode.isChecked():
+            self.last_speaker_time = current_time
+            return f"\n{text}"
+        
+        time_gap = current_time - self.last_speaker_time
+        should_new_speaker = False
+        
+        if time_gap > 4.0:
+            should_new_speaker = True
+        elif self.current_voice_features and voice_features.get('vad_available', False):
+            voice_change_score = self._calculate_voice_change_score(
+                self.current_voice_features, voice_features
+            )
+            
+            if voice_change_score > 0.6:
+                should_new_speaker = True
+        
+        last_lines = current_text.split('\n')[-2:]
+        last_content = ' '.join(line for line in last_lines if line.strip() and not line.startswith('👤'))
+        
+        if last_content and self._has_strong_conversation_markers(text, last_content):
+            should_new_speaker = True
+        
+        current_speaker_count = current_text.count('👤 Usuario')
+        if should_new_speaker and current_speaker_count >= 4:
+            should_new_speaker = False
+        
+        if should_new_speaker:
+            speaker_count = current_speaker_count + 1
+            self.last_speaker_time = current_time
+            self.voice_profiles.append(voice_features)
+            self.current_voice_features = voice_features
+            return f"\n\n👤 Usuario {speaker_count}:\n{text}"
+        else:
+            self.last_speaker_time = current_time
+            if self.current_voice_features:
+                self.current_voice_features = self._merge_voice_features(
+                    self.current_voice_features, voice_features
+                )
+            return f"\n{text}"
+
+    def _calculate_voice_change_score(self, prev_features, curr_features):
+        try:
+            score = 0.0
+            
+            if prev_features.get('energy', 0) > 0 and curr_features.get('energy', 0) > 0:
+                energy_ratio = abs(curr_features['energy'] - prev_features['energy']) / prev_features['energy']
+                if energy_ratio > 0.5:
+                    score += 0.3
+            
+            prev_freq = prev_features.get('dominant_freq', 0)
+            curr_freq = curr_features.get('dominant_freq', 0)
+            if prev_freq > 50 and curr_freq > 50:
+                freq_change = abs(curr_freq - prev_freq) / max(prev_freq, curr_freq)
+                if freq_change > 0.2:
+                    score += 0.4
+            
+            prev_speech_ratio = prev_features.get('speech_ratio', 0)
+            curr_speech_ratio = curr_features.get('speech_ratio', 0)
+            speech_ratio_change = abs(curr_speech_ratio - prev_speech_ratio)
+            if speech_ratio_change > 0.3:
+                score += 0.2
+            
+            prev_zcr = prev_features.get('zero_crossings', 0)
+            curr_zcr = curr_features.get('zero_crossings', 0)
+            if prev_zcr > 0 and curr_zcr > 0:
+                zcr_change = abs(curr_zcr - prev_zcr) / max(prev_zcr, curr_zcr)
+                if zcr_change > 0.4:
+                    score += 0.1
+            
+            return min(score, 1.0)
+            
+        except Exception:
+            return 0.0
+    
+    def _merge_voice_features(self, prev_features, curr_features):
+        try:
+            merged = {}
+            
+            for key in ['energy', 'zero_crossings', 'dominant_freq', 'speech_ratio']:
+                prev_val = prev_features.get(key, 0)
+                curr_val = curr_features.get(key, 0)
+                merged[key] = prev_val * 0.7 + curr_val * 0.3
+            
+            merged['vad_available'] = curr_features.get('vad_available', False)
+            merged['duration'] = curr_features.get('duration', 0)
+            
+            return merged
+            
+        except Exception:
+            return curr_features
+    
+    def _has_strong_conversation_markers(self, current_text, previous_text):
+        current_lower = current_text.lower()
+        
+        strong_markers = [
+            'perdón pero', 'disculpa', 'perdona', 'una pregunta',
+            'yo opino que', 'no estoy de acuerdo', 'me parece que no',
+            'por mi parte', 'desde mi punto de vista', 'en mi experiencia',
+            'cambiando de tema', 'otra cosa', 'bueno ahora',
+            'quería agregar', 'solo para aclarar', 'tengo una duda'
         ]
         
-        for language, use_show_all in language_configs:
-            try:
-                if use_show_all:
-                    result = self.speech_recognizer.recognize_google(audio, language=language, show_all=True)
-                    text = self._extract_best_result(result)
-                else:
-                    text = self.speech_recognizer.recognize_google(audio, language=language)
-                
-                if text and isinstance(text, str) and text.strip():
-                    print(f"Reconocido con {language}: {text}")
-                    return text
-                    
-            except sr.UnknownValueError:
-                continue
-            except sr.RequestError as e:
-                print(f"Error de request con {language}: {e}")
-                continue
-            except Exception as e:
-                print(f"Error inesperado con {language}: {e}")
-                continue
+        starts_with_marker = any(current_lower.startswith(marker) for marker in strong_markers)
         
-        raise sr.UnknownValueError("No se pudo reconocer con ningún idioma")
+        if previous_text:
+            similarity = self._calculate_text_similarity(current_text, previous_text[-100:])
+            semantic_change = similarity < 0.1
+        else:
+            semantic_change = False
+        
+        return starts_with_marker or semantic_change
 
-    def _extract_best_result(self, result):
-        """Extrae el mejor resultado de un diccionario de reconocimiento."""
-        if isinstance(result, str):
-            return result
-        elif isinstance(result, dict):
-            if 'alternative' in result:
-                alternatives = result['alternative']
-                if alternatives and len(alternatives) > 0:
-                    best_alt = alternatives[0]
-                    if 'transcript' in best_alt:
-                        return best_alt['transcript']
-            for key in ['transcript', 'text', 'result']:
-                if key in result:
-                    return str(result[key])
-        elif isinstance(result, list) and len(result) > 0:
-            return str(result[0])
-        return ""
-
-    def _configure_microphone_for_fast_speech(self):
-        """Configuración específica del micrófono para habla rápida"""
+    def _handle_text_update(self, data):
         try:
-            if not self.microphone:
-                self.microphone = sr.Microphone()
-            with self.microphone as source:
-                for _ in range(3):
-                    self.speech_recognizer.adjust_for_ambient_noise(source, duration=0.1)
-            original_threshold = self.speech_recognizer.energy_threshold
-            self.speech_recognizer.energy_threshold = max(300, int(original_threshold * 0.7))
-            # Ajustes finos
-            self.speech_recognizer.non_speaking_duration = 0.3
-            self.speech_recognizer.pause_threshold = min(self.speech_recognizer.pause_threshold, 0.5)
-            print(f"Micrófono configurado para habla rápida. Threshold: {self.speech_recognizer.energy_threshold}")
+            text = ""
+            voice_features = {}
+            
+            try:
+                if data.startswith('{"text"') and data.endswith('}'):
+                    parsed_data = json.loads(data)
+                    text = parsed_data.get("text", "")
+                    voice_features = parsed_data.get("voice_features", {})
+                else:
+                    text = data
+                    voice_features = {}
+            except (json.JSONDecodeError, TypeError):
+                text = str(data) if data else ""
+                voice_features = {}
+            
+            if not text or len(text.strip()) < 2:
+                return
+            
+            formatted_text = self._detect_speaker_changes_with_vad(text, voice_features)
+            self.text_buffer.append(formatted_text)
+            self._auto_generate_title()
+            QTimer.singleShot(100, self._force_button_update)
+            
         except Exception as e:
-            print(f"Error configurando micrófono para habla rápida: {e}")
+            if isinstance(data, str) and data.strip():
+                self.text_buffer.append(f"\n{data}")
 
-    def _recognize_with_deduplication(self, audio):
-        """Reconocimiento con deduplicación estilo ventana temporal."""
-        try:
-            text = self.speech_recognizer.recognize_google(audio, language='es-CL')
-            if not text or not text.strip():
-                return ""
-            current_time = time.time()
-            for timestamp, prev_text in list(self.recent_texts):
-                if current_time - timestamp < 2.0:
-                    similarity = self._calculate_text_similarity(text, prev_text)
-                    if similarity > 0.75:
-                        return ""  # duplicado reciente
-            self.recent_texts.append((current_time, text))
-            cutoff = current_time - 3.0
-            self.recent_texts = [(t, txt) for t, txt in self.recent_texts if t > cutoff]
-            return text
-        except Exception as e:
-            print(f"Error en reconocimiento con deduplicación: {e}")
-            return ""
+    def _force_button_update(self):
+        text = self.transcript_preview.toPlainText().strip()
+        clean_text = self._clean_content(text)
+        
+        if clean_text and len(clean_text) > 10:
+            self.btn_save_note.setEnabled(True)
+            self.btn_copy.setEnabled(True)
+
+    def _auto_generate_title(self):
+        if self.title_edit.text().strip() in ["", "Título automático..."]:
+            if self.realtime_text and len(self.realtime_text) > 0:
+                combined_text = " ".join(self.realtime_text)
+                if len(combined_text.split()) >= 3:
+                    words = combined_text.split()[:6]
+                    suggested_title = " ".join(words)
+                    if len(combined_text.split()) > 6:
+                        suggested_title += "..."
+                    self.title_edit.setText(suggested_title)
+
+    def _flush_text_buffer(self):
+        if not self.text_buffer:
+            return
+
+        pending = self.text_buffer[:]
+        self.text_buffer.clear()
+
+        current_text = self.transcript_preview.toPlainText()
+        if "🎤" in current_text and "Transcripción" in current_text:
+            self.transcript_preview.clear()
+            current_text = ""
+
+        merged = []
+        current_paragraph = []
+
+        for chunk in pending:
+            chunk_str = self._process_fast_speech_text(str(chunk))
+            
+            if chunk_str.startswith('\n\n'):
+                if current_paragraph:
+                    merged.append(" ".join(current_paragraph))
+                    current_paragraph = []
+                clean_chunk = chunk_str.replace('\n\n', '').strip()
+                if clean_chunk:
+                    current_paragraph = [clean_chunk]
+            else:
+                clean_chunk = chunk_str.strip()
+                if clean_chunk:
+                    current_paragraph.append(clean_chunk)
+            
+            if current_paragraph and len(" ".join(current_paragraph)) > 150:
+                merged.append(" ".join(current_paragraph))
+                current_paragraph = []
+
+        if current_paragraph:
+            merged.append(" ".join(current_paragraph))
+
+        if merged:
+            cursor = self.transcript_preview.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            for line in merged:
+                self.transcript_preview.append(line)
+            self.transcript_preview.setTextCursor(cursor)
+
+        self.transcript_preview.update()
+        QCoreApplication.processEvents()
+
+    def _process_fast_speech_text(self, text):
+        if not isinstance(text, str):
+            text = str(text)
+        text = ' '.join(text.split())
+        fast_speech_corrections = {
+            'esque': 'es que', 'porfa': 'por favor', 'obvio': 'obviamente',
+            'osea': 'o sea', 'porfavor': 'por favor', 'nose': 'no sé',
+            'nomas': 'no más', 'aver': 'a ver', 'deuna': 'de una',
+            'yapo': 'ya poh'
+        }
+        words = text.split()
+        corrected_words = []
+        for word in words:
+            word_lower = word.lower().strip('.,!?')
+            corrected_words.append(fast_speech_corrections.get(word_lower, word))
+        return ' '.join(corrected_words)
 
     def _calculate_text_similarity(self, text1, text2):
-        """Calcula similitud entre textos (simple)."""
         if not text1 or not text2:
             return 0.0
         words1 = set(text1.lower().split())
@@ -2894,185 +3306,48 @@ class EnhancedTranscribeTab(QWidget):
         union = words1.union(words2)
         return len(intersection) / len(union) if union else 0.0
 
-    # ------------------------------------------------------------------
-    # UI / Buffer
-    # ------------------------------------------------------------------
-    def _flush_text_buffer(self):
-        """Flush ultra rápido y seguro para la UI (evita perder texto)."""
-        if not self.text_buffer:
-            return
-
-        pending = self.text_buffer[:]
-        self.text_buffer.clear()
-
-        # Limpia placeholder si es el primer flush real
-        current_text = self.transcript_preview.toPlainText()
-        if "🎤" in current_text and "Transcripción profesional activa" in current_text:
-            self.transcript_preview.clear()
-            current_text = ""
-
-        # Ensambla líneas cortas preservando párrafos de hablantes
-        merged = []
-        current_paragraph = []
-
-        for chunk in pending:
-            chunk_str = self._process_fast_speech_text(str(chunk))
-            
-            # Si el chunk empieza con salto de línea, es nuevo párrafo
-            if chunk_str.startswith('\n\n'):
-                # Finalizar párrafo actual
-                if current_paragraph:
-                    merged.append(" ".join(current_paragraph))
-                    current_paragraph = []
-                # Agregar nuevo párrafo
-                clean_chunk = chunk_str.replace('\n\n', '').strip()
-                if clean_chunk:
-                    current_paragraph = [clean_chunk]
-            else:
-                # Agregar al párrafo actual
-                clean_chunk = chunk_str.strip()
-                if clean_chunk:
-                    current_paragraph.append(clean_chunk)
-            
-            # Si el párrafo se vuelve muy largo, dividir
-            if current_paragraph and len(" ".join(current_paragraph)) > 150:
-                merged.append(" ".join(current_paragraph))
-                current_paragraph = []
-
-        # Agregar último párrafo
-        if current_paragraph:
-            merged.append(" ".join(current_paragraph))
-
-        # Inserta de una vez para minimizar coste en el hilo de GUI
-        if merged:
-            cursor = self.transcript_preview.textCursor()
-            cursor.movePosition(QTextCursor.MoveOperation.End)
-            for line in merged:
-                self.transcript_preview.append(line)
-            self.transcript_preview.setTextCursor(cursor)
-
-        # Forzar repintado rápido
-        self.transcript_preview.update()
-        QCoreApplication.processEvents()
-    def _process_fast_speech_text(self, text: str) -> str:
-        """Procesa texto específicamente para habla rápida"""
-        if not isinstance(text, str):
-            text = str(text)
-        text = ' '.join(text.split())
-        fast_speech_corrections = {
-            'esque': 'es que',
-            'porfa': 'por favor', 
-            'obvio': 'obviamente',
-            'osea': 'o sea',
-            'porfavor': 'por favor',
-            'nose': 'no sé',
-            'nomas': 'no más',
-            'aver': 'a ver',
-            'deuna': 'de una',
-            'yapo': 'ya poh'
-        }
-        words = text.split()
-        corrected_words = []
-        for word in words:
-            word_lower = word.lower().strip('.,!?')
-            corrected_words.append(fast_speech_corrections.get(word_lower, word))
-        return ' '.join(corrected_words)
-    def _detect_speaker_continuation(self, new_text: str) -> bool:
-        """Detecta si el texto continúa del mismo hablante"""
-        if not self.realtime_text:
-            return False
-        
-        last_text = self.realtime_text[-1] if self.realtime_text else ""
-        
-        # Patrones que indican continuación del mismo hablante
-        continuation_patterns = [
-            r'\b(entonces|después|luego|también|además|y|pero|sin embargo)\b',
-            r'\b(por eso|por lo tanto|así que|porque)\b',
-            r'\b(ahora|ahí|aquí|esto|eso)\b'
+    def _recognize_with_multiple_languages(self, audio):
+        language_configs = [
+            ('es-CL', False), ('es-419', False), ('es-AR', False),
+            ('es-MX', False), ('es-ES', False),
         ]
         
-        # Verificar si el nuevo texto comienza con palabras de continuación
-        new_text_lower = new_text.lower().strip()
-        for pattern in continuation_patterns:
-            if re.match(pattern, new_text_lower):
-                return True
+        for language, use_show_all in language_configs:
+            try:
+                text = self.speech_recognizer.recognize_google(audio, language=language)
+                if text and isinstance(text, str) and text.strip():
+                    return text
+            except:
+                continue
         
-        # Verificar si no hay cambio abrupto de tema
-        last_words = last_text.split()[-3:] if last_text else []
-        new_words = new_text.split()[:3]
-        
-        # Si hay palabras en común, probablemente es continuación
-        common_words = set(word.lower() for word in last_words) & set(word.lower() for word in new_words)
-        if len(common_words) > 0:
-            return True
-        
-        return False
+        raise sr.UnknownValueError("No se pudo reconocer con ningún idioma")
 
-    def _should_create_new_paragraph(self, new_text: str) -> bool:
-        """Determina si se debe crear un nuevo párrafo"""
-        if not self.realtime_text:
-            return False
-        
-        # Patrones que indican nuevo hablante o tema
-        new_speaker_patterns = [
-            r'^[A-Z][a-z]+:',  # "Juan:"
-            r'\b(bueno|ok|vale|perfecto|excelente|gracias)\b',  # Palabras de transición
-            r'\b(pregunta|comentario|opinión|creo que|pienso que)\b'
-        ]
-        
-        new_text_lower = new_text.lower().strip()
-        for pattern in new_speaker_patterns:
-            if re.search(pattern, new_text_lower):
-                return True
-        
-        # Si hay una pausa larga (esto se puede detectar por timestamp si está disponible)
-        # Por ahora, usar heurística simple
-        last_text = self.realtime_text[-1] if self.realtime_text else ""
-        if len(last_text) > 0 and not self._detect_speaker_continuation(new_text):
-            return True
-        
-        return False
-    def _handle_text_update(self, text: str):
-        """Maneja actualización de texto thread-safe con detección de hablantes"""
-        if not isinstance(text, str) or not text.strip():
-            return
-        
-        # Determinar si es continuación o nuevo párrafo
-        if self._should_create_new_paragraph(text):
-            # Nuevo párrafo
-            self.text_buffer.append(f"\n\n{text}")
-        elif self._detect_speaker_continuation(text):
-            # Continuar en la misma línea
-            self.text_buffer.append(f" {text}")
-        else:
-            # Comportamiento por defecto (nueva línea)
-            self.text_buffer.append(text)
-        
-        self._auto_generate_title()
+    def _configure_microphone_for_fast_speech(self):
+        try:
+            if not self.microphone:
+                self.microphone = sr.Microphone()
+            with self.microphone as source:
+                for _ in range(3):
+                    self.speech_recognizer.adjust_for_ambient_noise(source, duration=0.1)
+            original_threshold = self.speech_recognizer.energy_threshold
+            self.speech_recognizer.energy_threshold = max(300, int(original_threshold * 0.7))
+            self.speech_recognizer.non_speaking_duration = 0.6
+            self.speech_recognizer.pause_threshold = min(self.speech_recognizer.pause_threshold, 0.8)
+        except Exception as e:
+            print(f"Error configurando micrófono: {e}")
 
-    # ------------------------------------------------------------------
-    # Permisos de micrófono
-    # ------------------------------------------------------------------
     def _check_and_request_microphone_access(self):
-        """Verifica permisos y guía al usuario si es necesario"""
         try:
             recognizer = sr.Recognizer()
             mic = sr.Microphone()
             with mic as source:
                 recognizer.adjust_for_ambient_noise(source, duration=0.5)
             return True
-        except Exception as e:
-            print(f"Error accediendo al micrófono: {e}")
-            try:
-                if self._request_microphone_permission():
-                    return True
-            except Exception as ex:
-                print(f"Error solicitando permisos de micrófono: {ex}")
+        except Exception:
             self._show_permission_guide()
             return False
 
     def _show_permission_guide(self):
-        """Muestra guía detallada para habilitar permisos"""
         guide_text = """
 Para habilitar el micrófono:
 
@@ -3080,12 +3355,6 @@ Para habilitar el micrófono:
 2. Selecciona "Privacidad y Seguridad"
 3. En el panel izquierdo, busca "Micrófono"
 4. Asegúrate de que esta aplicación esté marcada ✓
-
-Aplicaciones que pueden aparecer:
-- Python
-- Terminal
-- PyCharm (si usas IDE)
-- SecreIA
 
 Después de habilitar los permisos, reinicia la aplicación.
         """
@@ -3095,467 +3364,95 @@ Después de habilitar los permisos, reinicia la aplicación.
         msg.setText("Permisos de micrófono requeridos")
         msg.setDetailedText(guide_text)
         msg.setIcon(QMessageBox.Information)
-        
-        open_settings_btn = msg.addButton("Abrir Configuración", QMessageBox.ActionRole)
-        try_again_btn = msg.addButton("Intentar de nuevo", QMessageBox.AcceptRole)
-        cancel_btn = msg.addButton("Cancelar", QMessageBox.RejectRole)
-        
         msg.exec()
-        
-        clicked_button = msg.clickedButton()
-        
-        if clicked_button == open_settings_btn:
-            self._open_system_preferences()
-        elif clicked_button == try_again_btn:
-            QTimer.singleShot(1000, self._test_speech_recognition)
 
-    def _open_system_preferences(self):
-        """Abre la configuración del sistema en la sección correcta"""
-        import subprocess
-        import sys
-        
-        try:
-            if sys.platform == "darwin":
-                subprocess.run([
-                    "open", 
-                    "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
-                ])
-            else:
-                QMessageBox.information(
-                    self,
-                    "Configuración manual",
-                    "Busca 'Permisos de micrófono' en la configuración de tu sistema."
-                )
-        except Exception:
-            if sys.platform == "darwin":
-                subprocess.run(["open", "/System/Applications/System Preferences.app"])
-
-    def _request_microphone_permission(self):
-        """Solicita permisos de micrófono de forma natural"""
-        try:
-            reply = QMessageBox.question(
-                self, 
-                "Permisos de micrófono",
-                "Esta aplicación necesita acceso al micrófono para transcribir audio.\n\n"
-                "macOS te pedirá permisos cuando continúes.\n"
-                "Por favor, selecciona 'Permitir' cuando aparezca el diálogo.",
-                QMessageBox.Ok | QMessageBox.Cancel
-            )
-            if reply != QMessageBox.Ok:
-                return False
-            
-            recognizer = sr.Recognizer()
-            mic = sr.Microphone()
-            with mic as source:
-                recognizer.adjust_for_ambient_noise(source, duration=0.5)
-            return True
-        except Exception as e:
-            QMessageBox.critical(
-                self,
-                "Error de permisos",
-                f"No se pudieron obtener permisos de micrófono.\n\n"
-                f"Error: {e}\n\n"
-                f"Ve a Configuración del Sistema > Privacidad y Seguridad > Micrófono"
-            )
-            return False
-    
-    # ------------------------------------------------------------------
-    # UI
-    # ------------------------------------------------------------------
-    def _setup_ui(self):
-        """Configura interfaz de transcripción en tiempo real"""
-        layout = QVBoxLayout(self)
-        layout.setSpacing(24)
-        layout.setContentsMargins(40, 40, 40, 40)
-        
-        # Header
-        header = QLabel("Transcripción en tiempo real")
-        header.setStyleSheet(f"""
-            QLabel {{
-                color: {AppleColors.PRIMARY.name()};
-                font-family: '.AppleSystemUIFont';
-                font-size: 28px;
-                font-weight: 300;
-            }}
-        """)
-        header.setAlignment(Qt.AlignCenter)
-        layout.addWidget(header)
-        
-        # Estado del reconocimiento
-        status_card = AppleCard()
-        status_layout = status_card.layout()
-        
-        if self.recognition_working:
-            status_text = "Reconocimiento de voz: Listo"
-            status_color = AppleColors.GREEN.name()
-            status_icon = "✅"
-        else:
-            status_text = "Reconocimiento de voz: No disponible - Verifica micrófono y permisos"
-            status_color = AppleColors.RED.name()
-            status_icon = "❌"
-        
-        self.status_info = QLabel(f"{status_icon} {status_text}")
-        self.status_info.setStyleSheet(f"""
-            QLabel {{
-                color: {status_color};
-                font-size: 14px;
-                font-weight: 500;
-                padding: 8px;
-                background: transparent;
-                border: none;
-            }}
-        """)
-        status_layout.addWidget(self.status_info)
-        layout.addWidget(status_card)
-        
-        # Panel de controles principales
-        controls_card = AppleCard()
-        controls_layout = controls_card.layout()
-        
-        # Botones principales
-        buttons_layout = QHBoxLayout()
-        buttons_layout.setSpacing(16)
-        
-        self.btn_start = AppleButton("🎤 Iniciar transcripción", "primary")
-        self.btn_start.clicked.connect(self.start_transcription)
-        self.btn_start.setFixedHeight(50)
-        self.btn_start.setEnabled(self.recognition_working)
-        
-        self.btn_stop = AppleButton("⏹ Detener transcripción", "danger")
-        self.btn_stop.clicked.connect(self.stop_transcription)
-        self.btn_stop.setEnabled(False)
-        self.btn_stop.setFixedHeight(50)
-        self.btn_stop.hide()
-        
-        self.btn_help = AppleButton("🔧 Ayuda con permisos", "ghost")
-        self.btn_help.clicked.connect(self._show_permission_guide)
-        
-        buttons_layout.addWidget(self.btn_start)
-        buttons_layout.addWidget(self.btn_stop)
-        buttons_layout.addWidget(self.btn_help)
-        
-        # Indicadores de estado
-        status_widget = QWidget()
-        status_widget_layout = QVBoxLayout(status_widget)
-        status_widget_layout.setContentsMargins(0, 0, 0, 0)
-        status_widget_layout.setSpacing(4)
-        
-        status_title = QLabel("Estado:")
-        status_title.setStyleSheet(f"""
-            QLabel {{
-                color: {AppleColors.SECONDARY.name()};
-                font-size: 11px;
-                border: none;
-            }}
-        """)
-        
-        self.status_indicator = QLabel("Listo")
-        self.status_indicator.setStyleSheet(f"""
-            QLabel {{
-                color: {AppleColors.SECONDARY.name()};
-                font-size: 12px;
-                border: none;
-                padding: 4px 8px;
-                background-color: {AppleColors.CARD.name()};
-                border-radius: 4px;
-            }}
-        """)
-        
-        status_widget_layout.addWidget(status_title)
-        status_widget_layout.addWidget(self.status_indicator)
-        
-        buttons_layout.addWidget(status_widget)
-        buttons_layout.addStretch()
-        
-        controls_layout.addLayout(buttons_layout)
-        
-        # Status general
-        self.status_label = QLabel("Listo para transcribir" if self.recognition_working else "Configura micrófono para continuar")
-        self.status_label.setStyleSheet(f"""
-            QLabel {{
-                color: {AppleColors.SECONDARY.name()};
-                font-family: '.AppleSystemUIFont';
-                font-size: 13px;
-                padding: 8px 12px;
-                border: none;
-                background-color: {AppleColors.ELEVATED.name()};
-                border-radius: 6px;
-            }}
-        """)
-        self.status_label.setAlignment(Qt.AlignCenter)
-        controls_layout.addWidget(self.status_label)
-        
-        # Separador
-        separator = QFrame()
-        separator.setFrameShape(QFrame.HLine)
-        separator.setStyleSheet(f"""
-            QFrame {{
-                color: {AppleColors.SEPARATOR_LIGHT.name()};
-                margin: 8px 0;
-            }}
-        """)
-        controls_layout.addWidget(separator)
-        
-        # Configuración de nota
-        config_layout = QVBoxLayout()
-        config_layout.setSpacing(12)
-        
-        # Título
-        title_layout = QHBoxLayout()
-        title_layout.setSpacing(12)
-        
-        title_label = QLabel("Título:")
-        title_label.setStyleSheet(f"""
-            QLabel {{
-                color: {AppleColors.PRIMARY.name()};
-                font-size: 13px;
-                font-weight: 500;
-                background: transparent;
-                border: none;
-                min-width: 60px;
-            }}
-        """)
-        
-        self.title_edit = QLineEdit("Título automático...")
-        self.title_edit.setStyleSheet(f"""
-            QLineEdit {{
-                background-color: {AppleColors.SIDEBAR.name()};
-                color: {AppleColors.PRIMARY.name()};
-                border: 1px solid {AppleColors.SEPARATOR.name()};
-                border-radius: 6px;
-                padding: 8px 12px;
-                font-family: '.AppleSystemUIFont';
-                font-size: 13px;
-            }}
-            QLineEdit:focus {{
-                border: 2px solid {AppleColors.BLUE.name()};
-                padding: 7px 11px;
-                background-color: {AppleColors.NOTES_LIST.name()};
-            }}
-        """)
-        
-        title_layout.addWidget(title_label)
-        title_layout.addWidget(self.title_edit, 1)
-        
-        # Categoría
-        category_layout = QHBoxLayout()
-        category_layout.setSpacing(12)
-        
-        category_label = QLabel("Categoría:")
-        category_label.setStyleSheet(f"""
-            QLabel {{
-                color: {AppleColors.PRIMARY.name()};
-                font-size: 13px;
-                font-weight: 500;
-                background: transparent;
-                border: none;
-                min-width: 70px;
-            }}
-        """)
-        
-        self.category_combo = QComboBox()
-        self.category_combo.setStyleSheet(f"""
-            QComboBox {{
-                background-color: {AppleColors.SIDEBAR.name()};
-                color: {AppleColors.PRIMARY.name()};
-                border: 1px solid {AppleColors.SEPARATOR.name()};
-                border-radius: 6px;
-                padding: 8px 12px;
-                font-family: '.AppleSystemUIFont';
-                font-size: 13px;
-                min-width: 150px;
-            }}
-            QComboBox::drop-down {{
-                border: none;
-            }}
-            QComboBox QAbstractItemView {{
-                background-color: {AppleColors.ELEVATED.name()};
-                border: 1px solid {AppleColors.SEPARATOR.name()};
-                selection-background-color: {AppleColors.BLUE.name()};
-                selection-color: white;
-            }}
-        """)
-        
-        # Cargar categorías
-        categories = self.db.list_categories()
-        if "Transcripciones" not in categories:
-            categories.insert(0, "Transcripciones")
-        for cat in categories:
-            self.category_combo.addItem(cat)
-        self.category_combo.setCurrentText("Transcripciones")
-        
-        category_layout.addWidget(category_label)
-        category_layout.addWidget(self.category_combo)
-        category_layout.addStretch()
-        
-        config_layout.addLayout(title_layout)
-        config_layout.addLayout(category_layout)
-        controls_layout.addLayout(config_layout)
-        
-        layout.addWidget(controls_card)
-        
-        # Vista previa de transcripción
-        preview_header = QLabel("Transcripción en vivo")
-        preview_header.setStyleSheet(f"""
-            QLabel {{
-                color: {AppleColors.PRIMARY.name()};
-                font-family: '.AppleSystemUIFont';
-                font-size: 16px;
-                font-weight: 600;
-                margin-top: 8px;
-            }}
-        """)
-        layout.addWidget(preview_header)
-        
-        self.transcript_preview = QTextEdit()
-        self.transcript_preview.setReadOnly(True)
-        self.transcript_preview.setPlaceholderText("El texto aparecerá aquí mientras hablas...")
-        self.transcript_preview.setStyleSheet(f"""
-            QTextEdit {{
-                background-color: {AppleColors.NOTES_LIST.name()};
-                color: {AppleColors.PRIMARY.name()};
-                border: none;
-                border-radius: 12px;
-                padding: 20px;
-                font-family: '.AppleSystemUIFont';
-                font-size: 15px;
-                line-height: 1.6;
-            }}
-        """)
-        
-        layout.addWidget(self.transcript_preview, 3)
-        
-        # Botones de acción
-        actions_layout = QHBoxLayout()
-        actions_layout.setSpacing(12)
-        
-        self.btn_save_note = AppleButton("💾 Guardar como nota", "secondary")
-        self.btn_save_note.clicked.connect(self._save_as_note)
-        self.btn_save_note.setEnabled(False)
-        
-        self.btn_copy = AppleButton("📋 Copiar texto", "ghost")
-        self.btn_copy.clicked.connect(self._copy_transcription)
-        self.btn_copy.setEnabled(False)
-        
-        self.btn_clear = AppleButton("🗑️ Limpiar", "ghost")
-        self.btn_clear.clicked.connect(self._clear_transcription)
-        self.btn_clear.setEnabled(False)
-        
-        actions_layout.addWidget(self.btn_save_note)
-        actions_layout.addWidget(self.btn_copy)
-        actions_layout.addWidget(self.btn_clear)
-        actions_layout.addStretch()
-        layout.addLayout(actions_layout)
-        
-        # Conectar eventos
-        self.transcript_preview.textChanged.connect(self._on_transcript_changed)
-        
-        # Timer para duración
-        self.duration_timer = QTimer()
-        self.duration_timer.timeout.connect(self._update_duration)
-        
-        # Timer para actualizaciones de UI
-        self.ui_update_timer = QTimer()
-        self.ui_update_timer.timeout.connect(self._flush_text_buffer)
-        self.ui_update_timer.setInterval(int(self.update_interval * 1000))
-
-    # ------------------------------------------------------------------
-    # Estado/Errores/Auto título
-    # ------------------------------------------------------------------
-    def _handle_status_update(self, status: str):
-        """Maneja actualizaciones de estado"""
+    def _handle_status_update(self, status):
         if status == "silence_warning":
-            self._show_silence_warning()
+            self.text_buffer.append("\n⚠️ Silencio detectado")
 
-    def _handle_error_update(self, error: str):
-        """Maneja errores"""
-        if error == "api_error":
-            self._show_api_error()
-        elif error == "recognition_failed":
-            self._show_recognition_failed()
-        else:
-            self._handle_recognition_error(error)
-
-    def _auto_generate_title(self):
-        """Genera título automáticamente"""
-        if self.title_edit.text().strip() in ["", "Título automático..."]:
-            combined_text = " ".join(self.realtime_text)
-            if len(combined_text.split()) >= 3:
-                words = combined_text.split()[:6]
-                suggested_title = " ".join(words)
-                if len(combined_text.split()) > 6:
-                    suggested_title += "..."
-                self.title_edit.setText(suggested_title)
-
-    def _show_silence_warning(self):
-        """Muestra advertencia de silencio"""
-        self.text_buffer.append("\n⚠️ Silencio detectado - habla más cerca del micrófono")
-
-    def _show_api_error(self):
-        """Muestra error de API"""
-        self.text_buffer.append("\n❌ Error de conexión - reintentando...")
-
-    def _show_recognition_failed(self):
-        """Muestra falla del reconocimiento"""
-        self.text_buffer.append("\n❌ Reconocimiento falló - detén y vuelve a intentar")
-
-    def _handle_recognition_error(self, error: str):
-        """Maneja errores generales"""
+    def _handle_error_update(self, error):
         self.text_buffer.append(f"\n❌ Error: {error}")
 
-    # ------------------------------------------------------------------
-    # Mantenimiento de UI/Estado
-    # ------------------------------------------------------------------
     def _reset_state(self):
-        """Resetea estado de la interfaz"""
-        self.btn_start.show()
-        self.btn_stop.hide()
-        self.btn_start.setEnabled(self.recognition_working)
+        self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         
-        self.status_indicator.setText("Listo")
-        self.status_indicator.setStyleSheet(f"""
-            QLabel {{
-                color: {AppleColors.SECONDARY.name()};
-                font-size: 12px;
-                border: none;
-                padding: 4px 8px;
-                background-color: {AppleColors.CARD.name()};
-                border-radius: 4px;
-            }}
-        """)
+        self.status_label.setText("Listo")
         
         if hasattr(self, 'duration_timer'):
             self.duration_timer.stop()
-        
         if hasattr(self, 'ui_update_timer'):
             self.ui_update_timer.stop()
+        if hasattr(self, 'periodic_flush_timer'):
+            self.periodic_flush_timer.stop()
         
         self.is_transcribing = False
         self.recognition_active = False
 
     def _update_duration(self):
-        """Actualiza duración"""
         if self.is_transcribing and self.start_time:
             duration = time.time() - self.start_time
             mins = int(duration // 60)
             secs = int(duration % 60)
             self.status_label.setText(f"Transcribiendo... {mins:02d}:{secs:02d}")
 
-    def _on_transcript_changed(self):
-        """Habilita botones según contenido"""
-        text = self.transcript_preview.toPlainText().strip()
-        has_valid_text = bool(text and not text.startswith("🎤") and len(text) > 10)
+    def _clean_content(self, content):
+        if not content:
+            return ""
         
-        self.btn_save_note.setEnabled(has_valid_text)
-        self.btn_copy.setEnabled(has_valid_text)
-        self.btn_clear.setEnabled(bool(text))
+        content = content.replace("🎤 Transcripción activa", "")
+        content = content.replace("(VAD activo)", "")
+        
+        lines = content.split("\n")
+        clean_lines = []
+        
+        for line in lines:
+            line = line.strip()
+            
+            if not line:
+                continue
+            if line.startswith("⚠️") or line.startswith("❌"):
+                continue
+            if line.startswith('{"text"') or "voice_features" in line:
+                continue
+            
+            if line.startswith("👤 Usuario"):
+                parts = line.split(":", 1)
+                if len(parts) > 1:
+                    clean_text = parts[1].strip()
+                    if clean_text:
+                        clean_lines.append(clean_text)
+            else:
+                clean_lines.append(line)
+        
+        return "\n".join(clean_lines).strip()
 
-    # ------------------------------------------------------------------
-    # Guardado / Portapapeles
-    # ------------------------------------------------------------------
+    def _copy_transcription(self):
+        text = self.transcript_preview.toPlainText().strip()
+        if text and not text.startswith("🎤"):
+            clean_text = self._clean_content(text)
+            try:
+                import pyperclip
+                pyperclip.copy(clean_text)
+                QMessageBox.information(self, "Copiado", "Texto copiado al portapapeles")
+            except:
+                clipboard = QApplication.clipboard()
+                clipboard.setText(clean_text)
+                QMessageBox.information(self, "Copiado", "Texto copiado al portapapeles")
+
+    def _clear_transcription(self):
+        self.transcript_preview.clear()
+        self.title_edit.clear()
+        self.realtime_text = []
+        self.text_buffer = []
+        self.final_buffer = []
+        self.speaker_history = []
+        self.last_speaker_time = 0
+        self.voice_profiles = []
+        self.current_voice_features = None
+        self.status_label.setText("Listo para transcribir" if self.recognition_working else "Configura micrófono para continuar")
+
     def _save_as_note(self):
-        """Guarda como nota con loading"""
         content = self.transcript_preview.toPlainText().strip()
         title = self.title_edit.text().strip()
         
@@ -3568,148 +3465,81 @@ Después de habilitar los permisos, reinicia la aplicación.
         if not title or title == "Título automático...":
             title = "Transcripción " + datetime.now().strftime("%d/%m/%Y %H:%M")
         
-        # Mostrar loading
-        self._show_transcription_saving_state()
-        
-        # Usar QTimer para no bloquear UI
-        QTimer.singleShot(100, lambda: self._do_save_transcription(title, content))
-
-    def _show_transcription_saving_state(self):
-        """Muestra estado de guardado para transcripción"""
-        self.btn_save_note.setEnabled(False)
-        self.btn_save_note.setText("Guardando...")
-        
-        # Crear spinner si no existe
-        if not hasattr(self, 'save_spinner'):
-            self.save_spinner = LoadingSpinner(20)
-            # Agregar spinner al layout de botones de acción
-            actions_layout = self.btn_save_note.parent().layout()
-            actions_layout.insertWidget(0, self.save_spinner)
-        
-        self.save_spinner.show()
-        self.save_spinner.start()
-
-    def _do_save_transcription(self, title: str, content: str):
-        """Ejecuta el guardado real de transcripción"""
         try:
-            self._save_transcription(title, content)
-            self._show_transcription_success_state()
-            QTimer.singleShot(2000, self._clear_transcription)
+            from app.db import Note
+            category = self.category_combo.currentText().strip() or "Transcripciones"
+            
+            self.db.add_category(category)
+            note = Note(
+                id=None,
+                title=title,
+                content=content,
+                category=category,
+                tags=["transcripción", "tiempo-real"],
+                source="transcript",
+                audio_path=None,
+                created_at=datetime.utcnow().isoformat(),
+                updated_at=datetime.utcnow().isoformat(),
+            )
+            note_id = self.db.upsert_note(note)
+
+            if self.vector:
+                try:
+                    self.vector.index_note(note_id, title, content, category, ["transcripción", "tiempo-real"], "transcript")
+                except Exception as e:
+                    print(f"Error indexando: {e}")
+            
+            # NUEVO: Emitir señal para notificar a otras vistas
+            self.note_saved.emit()
+            
+            QMessageBox.information(self, "Guardado", f"Transcripción guardada como '{title}'")
+            
         except Exception as e:
-            self._show_transcription_error_state(str(e))
+            QMessageBox.critical(self, "Error", f"Error al guardar: {e}")
+    def _open_transcribe_settings(self):
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Configuración de Transcripción")
+        msg.setText("Ajustes de reconocimiento de voz")
+        msg.setDetailedText(f"""
+Configuración actual:
+- Umbral de energía: {getattr(self.speech_recognizer, 'energy_threshold', 'N/A')}
+- Pausa entre frases: {getattr(self.speech_recognizer, 'pause_threshold', 'N/A')} seg
+- Duración sin habla: {getattr(self.speech_recognizer, 'non_speaking_duration', 'N/A')} seg
+- Detección VAD: {'Activa' if self.vad_available else 'Inactiva'}
 
-    def _show_transcription_success_state(self):
-        """Muestra estado de éxito para transcripción"""
-        if hasattr(self, 'save_spinner'):
-            self.save_spinner.stop()
-            self.save_spinner.hide()
-        
-        self.btn_save_note.setEnabled(True)
-        self.btn_save_note.setText("✅ Guardado")
-        
-        # Restaurar después de 3 segundos
-        QTimer.singleShot(3000, lambda: self.btn_save_note.setText("💾 Guardar como nota"))
+Para mejor captura:
+- Hablar claramente y sin prisa
+- Hacer pausas naturales entre ideas
+- Evitar ruidos de fondo
+- Usar micrófono de calidad
+        """)
+        msg.exec()
 
-    def _show_transcription_error_state(self, error: str):
-        """Muestra estado de error para transcripción"""
-        if hasattr(self, 'save_spinner'):
-            self.save_spinner.stop()
-            self.save_spinner.hide()
-        
-        self.btn_save_note.setEnabled(True)
-        self.btn_save_note.setText("❌ Error")
-        
-        QMessageBox.critical(self, "Error", f"Error al guardar transcripción: {error}")
-        QTimer.singleShot(3000, lambda: self.btn_save_note.setText("💾 Guardar como nota"))
-    def _clean_content(self, content: str) -> str:
-        """Limpia el contenido de mensajes del sistema"""
-        content = content.replace("🎤 Escuchando...", "").strip()
-        lines = content.split("\n")
-        clean_lines = []
-        for line in lines:
-            line = line.strip()
-            if line and not line.startswith("⚠️") and not line.startswith("❌"):
-                clean_lines.append(line)
-        return " ".join(clean_lines)
-
-    def _copy_transcription(self):
-        """Copia al portapapeles"""
+    def _on_transcript_changed(self):
         text = self.transcript_preview.toPlainText().strip()
-        if text and not text.startswith("🎤"):
-            clean_text = self._clean_content(text)
-            try:
-                if pyperclip is not None:
-                    pyperclip.copy(clean_text)
-                else:
-                    clipboard = QApplication.clipboard()
-                    clipboard.setText(clean_text)
-                QMessageBox.information(self, "Copiado", "Texto copiado al portapapeles")
-            except Exception:
-                clipboard = QApplication.clipboard()
-                clipboard.setText(clean_text)
-                QMessageBox.information(self, "Copiado", "Texto copiado al portapapeles")
-
-    def _clear_transcription(self):
-        """Limpia la transcripción"""
-        self.transcript_preview.clear()
-        self.title_edit.setText("Título automático...")
-        self.realtime_text = []
-        self.text_buffer = []
-        self.status_label.setText("Listo para transcribir" if self.recognition_working else "Configura micrófono para continuar")
-
-    def _save_transcription(self, title: str, content: str):
-        """Guarda en base de datos"""
-        category = self.category_combo.currentText().strip() or "Transcripciones"
+        clean_text = self._clean_content(text)
+        has_content = bool(clean_text and len(clean_text) > 10)
         
-        self.db.add_category(category)
-        note = Note(
-            id=None,
-            title=title,
-            content=content,
-            category=category,
-            tags=["transcripción", "tiempo-real"],
-            source="transcript",
-            audio_path=None,  # Sin archivo de audio
-            created_at=datetime.utcnow().isoformat(),
-            updated_at=datetime.utcnow().isoformat(),
-        )
-        note_id = self.db.upsert_note(note)
-
-        if self.vector:
-            try:
-                self.vector.index_note(note_id, title, content)
-            except Exception as e:
-                print(f"Error indexando: {e}")
-
+        self.btn_save_note.setEnabled(has_content)
+        self.btn_copy.setEnabled(has_content)
+        
 class SearchTab(QWidget):
     """Tab de búsqueda estilo Apple - CORREGIDO"""
     
-    def __init__(self, settings: Settings, db: NotesDB, vector: Optional[VectorIndex], ai: AIService):
+    def __init__(self, settings: Settings, db: NotesDB, vector: Optional[VectorIndex], ai: AIService, main_window=None):
         super().__init__()
         self.settings = settings
         self.db = db
         self.vector = vector
         self.ai = ai
+        self.main_window = main_window  # NUEVO: Referencia al main window
         self._setup_ui()
     
     def _setup_ui(self):
         layout = QVBoxLayout(self)
         layout.setSpacing(32)
         layout.setContentsMargins(60, 60, 60, 60)
-        
-        # Header
-        header = QLabel("Búsqueda avanzada")
-        header.setStyleSheet(f"""
-            QLabel {{
-                color: {AppleColors.PRIMARY.name()};
-                font-family: '.AppleSystemUIFont';
-                font-size: 32px;
-                font-weight: 300;
-            }}
-        """)
-        header.setAlignment(Qt.AlignCenter)
-        layout.addWidget(header)
-        
+               
         # Barra de búsqueda
         search_card = AppleCard()
         search_layout = search_card.layout()
@@ -3771,14 +3601,17 @@ class SearchTab(QWidget):
         results_header.addWidget(self.results_count)
         layout.addLayout(results_header)
         
+        # Lista de resultados con funcionalidad de doble clic
         self.results = QListWidget()
         self.results.setStyleSheet(f"""
             QListWidget {{
-                background-color: transparent;
-                border: none;
+                background-color: {AppleColors.NOTES_LIST.name()};
+                border: 1px solid {AppleColors.SEPARATOR_LIGHT.name()};
+                border-radius: 12px;
                 outline: none;
                 font-family: '.AppleSystemUIFont';
                 font-size: 14px;
+                padding: 8px;
             }}
             QListWidget::item {{
                 background-color: {AppleColors.ELEVATED.name()};
@@ -3796,6 +3629,10 @@ class SearchTab(QWidget):
                 color: white;
             }}
         """)
+        
+        # NUEVO: Conectar doble clic para abrir nota
+        self.results.itemDoubleClicked.connect(self._open_note_from_search)
+        
         layout.addWidget(self.results, 1)
         
         # Conectar eventos
@@ -3897,6 +3734,50 @@ class SearchTab(QWidget):
             self.btn_semantic.setText("🧠 Búsqueda semántica")
             self.btn_semantic.setEnabled(True)
 
+    def _open_note_from_search(self, item):
+        """Abre nota seleccionada desde resultados de búsqueda"""
+        try:
+            # Obtener note_id del item
+            note_id = item.data(Qt.UserRole)
+            
+            if not note_id:
+                return
+            
+            # Verificar que la nota existe
+            note = self.db.get_note(note_id)
+            if not note:
+                QMessageBox.warning(self, "Nota no encontrada", 
+                                  "La nota seleccionada no existe o fue eliminada.")
+                return
+            
+            # Usar referencia directa al main_window
+            if self.main_window:
+                # Cambiar al tab de notas (índice 1)
+                self.main_window.stack.setCurrentIndex(1)
+                
+                # Cargar nota con pequeño delay para asegurar que el tab se carga
+                QTimer.singleShot(100, lambda: self._load_note_in_editor(note_id))
+            else:
+                QMessageBox.warning(self, "Error de navegación", 
+                                  "No se puede navegar a la nota. Intenta desde el tab de notas.")
+        
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"No se pudo abrir la nota: {e}")
+
+    def _load_note_in_editor(self, note_id):
+        """Carga nota específica en el editor"""
+        try:
+            if (self.main_window and 
+                hasattr(self.main_window, 'notes_view') and 
+                hasattr(self.main_window.notes_view, 'note_editor')):
+                
+                success = self.main_window.notes_view.note_editor.load_note(note_id)
+                if not success:
+                    QMessageBox.warning(self.main_window, "Error", 
+                                      "No se pudo cargar la nota seleccionada.")
+        except Exception as e:
+            print(f"Error cargando nota en editor: {e}")
+            
 class AnalyzeTab(QWidget):
     """Tab de análisis con RAG estilo Apple - MEJORADO con streaming"""
     
@@ -3913,18 +3794,6 @@ class AnalyzeTab(QWidget):
         layout.setSpacing(32)
         layout.setContentsMargins(60, 60, 60, 60)
         
-        # Header
-        header = QLabel("Análisis inteligente")
-        header.setStyleSheet(f"""
-            QLabel {{
-                color: {AppleColors.PRIMARY.name()};
-                font-family: '.AppleSystemUIFont';
-                font-size: 32px;
-                font-weight: 300;
-            }}
-        """)
-        header.setAlignment(Qt.AlignCenter)
-        layout.addWidget(header)
         
         # Descripción
         description = QLabel("Haz preguntas sobre el contenido de tus notas. La IA analizará tu información para darte respuestas precisas.")
@@ -4157,17 +4026,6 @@ class SettingsTab(QWidget):
         layout.setSpacing(24)
         layout.setContentsMargins(40, 40, 40, 40)
         
-        # Header
-        header = QLabel("Configuraciones")
-        header.setStyleSheet(f"""
-            QLabel {{
-                color: {AppleColors.PRIMARY.name()};
-                font-family: '.AppleSystemUIFont';
-                font-size: 28px;
-                font-weight: 300;
-            }}
-        """)
-        layout.addWidget(header)
         
         # API Configuration
         api_card = AppleCard("Configuración de OpenAI", "Configura tu acceso a los servicios de IA")
@@ -4455,32 +4313,7 @@ class CategoriesTab(QWidget):
         layout.setSpacing(24)
         layout.setContentsMargins(40, 40, 40, 40)
         
-        # Header
-        header_layout = QVBoxLayout()
-        title = QLabel("Administrar categorías")
-        title.setStyleSheet(f"""
-            QLabel {{
-                color: {AppleColors.PRIMARY.name()};
-                font-family: '.AppleSystemUIFont';
-                font-size: 28px;
-                font-weight: 300;
-            }}
-        """)
-        
-        subtitle = QLabel("Organiza y gestiona las categorías de tus notas")
-        subtitle.setStyleSheet(f"""
-            QLabel {{
-                color: {AppleColors.SECONDARY.name()};
-                font-family: '.AppleSystemUIFont';
-                font-size: 16px;
-                margin-top: 4px;
-            }}
-        """)
-        
-        header_layout.addWidget(title)
-        header_layout.addWidget(subtitle)
-        layout.addLayout(header_layout)
-        
+       
         # Panel de nueva categoría
         new_category_card = AppleCard("Nueva categoría", "Crear una nueva categoría para organizar tus notas")
         new_category_layout = new_category_card.layout()
@@ -5078,33 +4911,7 @@ class DashboardTab(QWidget):
         layout.setSpacing(24)
         layout.setContentsMargins(40, 40, 40, 40)
         
-        # Header
-        header_layout = QVBoxLayout()
-        title = QLabel("Dashboard")
-        title.setStyleSheet(f"""
-            QLabel {{
-                color: {AppleColors.PRIMARY.name()};
-                font-family: '.AppleSystemUIFont';
-                font-size: 28px;
-                font-weight: 300;
-            }}
-        """)
-        
-        subtitle = QLabel(f"Bienvenido • {datetime.now().strftime('%d de %B')}")
-        subtitle.setStyleSheet(f"""
-            QLabel {{
-                color: {AppleColors.SECONDARY.name()};
-                font-family: '.AppleSystemUIFont';
-                font-size: 14px;
-                margin-top: 4px;
-            }}
-        """)
-        
-        header_layout.addWidget(title)
-        header_layout.addWidget(subtitle)
-        layout.addLayout(header_layout)
-        
-        # Indicadores en línea
+        # Indicadores en línea (mantener igual)
         self.stats_label = QLabel("Notas: 0 | Categorías: 0 | Esta semana: 0 | Transcripciones: 0")
         self.stats_label.setStyleSheet(f"""
             QLabel {{
@@ -5121,7 +4928,7 @@ class DashboardTab(QWidget):
         self.stats_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.stats_label)
         
-        # Header de notas con acciones
+        # Header de notas con acciones (mantener igual)
         notes_header = QHBoxLayout()
         recent_label = QLabel("Notas recientes")
         recent_label.setStyleSheet(f"""
@@ -5141,16 +4948,18 @@ class DashboardTab(QWidget):
         notes_header.addWidget(new_note_action)
         layout.addLayout(notes_header)
         
-        # Lista de notas
+        # Lista de notas CON FONDO DIFERENTE
         self.recent_notes_list = QListWidget()
         self.recent_notes_list.setItemDelegate(NotesListDelegate())
         self.recent_notes_list.setStyleSheet(f"""
             QListWidget {{
-                background-color: transparent;
-                border: none;
+                background-color: {AppleColors.NOTES_LIST.name()};
+                border: 1px solid {AppleColors.SEPARATOR_LIGHT.name()};
+                border-radius: 12px;
                 outline: none;
                 font-family: '.AppleSystemUIFont';
                 font-size: 14px;
+                padding: 8px;
             }}
         """)
         self.recent_notes_list.itemDoubleClicked.connect(self._open_note_from_list)
@@ -5158,7 +4967,7 @@ class DashboardTab(QWidget):
         
         QTimer.singleShot(100, self._refresh_stats)
         QTimer.singleShot(1000, self._refresh_stats)
-
+    
     def _switch_tab(self, index: int):
         if hasattr(self.main_window, "stack"):
             self.main_window.stack.setCurrentIndex(index)
@@ -5390,15 +5199,18 @@ class MainWindow(QMainWindow):
         self.dashboard_tab = DashboardTab(self.settings, self.db, self)
         self.notes_view = EnhancedNotesView(self.settings, self.db, self.vector, self.ai)
         self.transcribe_tab = EnhancedTranscribeTab(self.settings, self.db, self.vector, self.ai)
-        self.search_tab = SearchTab(self.settings, self.db, self.vector, self.ai)
+        self.search_tab = SearchTab(self.settings, self.db, self.vector, self.ai, self)
         self.analyze_tab = AnalyzeTab(self.settings, self.db, self.vector, self.ai)
-        self.summary_tab = SummaryTab(self.settings, self.db, self.ai, self.vector)  # NUEVA LÍNEA
+        self.summary_tab = SummaryTab(self.settings, self.db, self.ai, self.vector)
         self.categories_tab = CategoriesTab(self.settings, self.db, self)
         self.settings_tab = SettingsTab(self.settings)
         
+        # NUEVO: Conectar señales entre tabs para sincronización
+        self._connect_cross_tab_signals()
+        
         # Agregar al stack
         for widget in [self.dashboard_tab, self.notes_view, self.transcribe_tab, 
-                    self.search_tab, self.analyze_tab, self.summary_tab,     # AGREGAR AQUÍ
+                    self.search_tab, self.analyze_tab, self.summary_tab,
                     self.categories_tab, self.settings_tab]:
             self.stack.addWidget(widget)
         
@@ -5423,8 +5235,49 @@ class MainWindow(QMainWindow):
         
         self.setCentralWidget(main_widget)
         self.stack.currentChanged.connect(self._on_view_changed)
+
+    def _connect_cross_tab_signals(self):
+        """Conecta señales entre tabs para sincronización"""
+        # Cuando se guarda desde editor de notas
+        self.notes_view.note_editor.note_saved.connect(self._on_note_saved_anywhere)
         
-    
+        # NUEVO: Cuando se guarda desde transcripción
+        self.transcribe_tab.note_saved.connect(self._on_note_saved_anywhere)
+        
+        # Cuando cambian categorías
+        self.categories_tab.categories_changed.connect(self._on_categories_changed)
+
+    def _on_note_saved_anywhere(self):
+        """NUEVO: Maneja guardado de notas desde cualquier tab"""
+        # Refrescar dashboard
+        if hasattr(self.dashboard_tab, '_refresh_stats'):
+            self.dashboard_tab._refresh_stats()
+        
+        # Refrescar lista de notas
+        if hasattr(self.notes_view, '_load_data'):
+            self.notes_view._load_data()
+        
+        # Limpiar resultados de búsqueda para forzar nueva búsqueda
+        if hasattr(self.search_tab, 'results'):
+            self.search_tab.results.clear()
+            self.search_tab.results_count.setText("0 resultados")
+
+    def _on_categories_changed(self):
+        """NUEVO: Maneja cambios en categorías"""
+        # Refrescar combos de categorías en transcripción
+        if hasattr(self.transcribe_tab, 'category_combo'):
+            current_text = self.transcribe_tab.category_combo.currentText()
+            self.transcribe_tab.category_combo.clear()
+            categories = self.db.list_categories()
+            for cat in categories:
+                self.transcribe_tab.category_combo.addItem(cat)
+            index = self.transcribe_tab.category_combo.findText(current_text)
+            if index >= 0:
+                self.transcribe_tab.category_combo.setCurrentIndex(index)
+        
+        # Refrescar editor de notas
+        if hasattr(self.notes_view, 'note_editor'):
+            self.notes_view.note_editor.refresh_categories()
     def _setup_services(self):
         db_path = os.path.join(self.settings.data_dir, "notes.db")
         self.db = NotesDB(db_path)
@@ -5473,9 +5326,12 @@ class MainWindow(QMainWindow):
         if index == 0 and hasattr(self, "dashboard_tab"):
             self.dashboard_tab._refresh_stats()
         
+        # NUEVO: Actualizar notas cuando se selecciona
+        elif index == 1 and hasattr(self, "notes_view"):
+            self.notes_view._load_data()
+        
         # Actualizar búsqueda cuando se selecciona
         elif index == 3 and hasattr(self, "search_tab"):
-            # Limpiar resultados previos
             if hasattr(self.search_tab, 'results'):
                 self.search_tab.results.clear()
                 self.search_tab.results_count.setText("0 resultados")
