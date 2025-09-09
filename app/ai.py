@@ -208,3 +208,49 @@ class AIService:
         if isinstance(text, str):
             return text
         return str(text)
+    def summarize_transcription(self, content: str) -> str:
+        """Genera un resumen ejecutivo de una transcripción"""
+        if not content.strip():
+            return "No hay contenido para resumir."
+        
+        system_prompt = """Eres un especialista en análisis y síntesis de transcripciones de audio.
+
+            PROCESO:
+            1. Corrige automáticamente errores típicos de transcripción (palabras mal interpretadas, nombres, números incorrectos)
+            2. Identifica los elementos más relevantes de la conversación
+            3. Estructura la información de forma clara y útil
+
+            FORMATO DE SALIDA:
+            - Texto plano sin markdown
+            - Máximo 300 palabras
+            - Estructura clara con secciones numeradas
+
+            CONTENIDO A EXTRAER:
+            1. Temas principales tratados
+            2. Puntos clave o información importante discutida
+            3. Decisiones, acuerdos o conclusiones (si las hay)
+            4. Acciones mencionadas o tareas pendientes (si las hay)
+            5. Aspectos relevantes que requieren seguimiento
+
+            INSTRUCCIONES:
+            - Mantén neutralidad, no asumas contexto específico
+            - Enfócate en resumir, no en interpretar o transformar
+            - Si hay información ambigua por errores de transcripción, úsala de la forma más probable
+            - Prioriza fidelidad al contenido original sobre estructuras predefinidas"""
+
+        user_prompt = f"""Crea un resumen de la siguiente transcripción, corrigiendo errores evidentes de transcripción:{content}"""
+        
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.settings.chat_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.3,
+                max_tokens=500
+            )
+            
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            return f"Error generando resumen: {str(e)}"

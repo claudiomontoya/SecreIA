@@ -2632,11 +2632,15 @@ class EnhancedTranscribeTab(QWidget):
         actions = QHBoxLayout(); actions.addStretch(1)
         self.btn_save_note = QPushButton("💾 Guardar"); self.btn_save_note.setEnabled(False); style_btn(self.btn_save_note)
         self.btn_copy = QPushButton("📋 Copiar"); self.btn_copy.setEnabled(False); style_btn(self.btn_copy)
+        self.btn_summarize = QPushButton("📝 Resumen"); self.btn_summarize.setEnabled(False); style_btn(self.btn_summarize)  # NUEVO
         self.btn_clear = QPushButton("🗑️ Limpiar"); style_btn(self.btn_clear)
         self.btn_save_note.clicked.connect(self._save_as_note)
         self.btn_copy.clicked.connect(self._copy_transcription)
+        self.btn_summarize.clicked.connect(self._summarize_transcription)  # NUEVO
         self.btn_clear.clicked.connect(self._clear_transcription)
-        actions.addWidget(self.btn_save_note); actions.addWidget(self.btn_copy); actions.addWidget(self.btn_clear)
+        actions.addWidget(self.btn_save_note); actions.addWidget(self.btn_copy); 
+        actions.addWidget(self.btn_summarize)  # NUEVO
+        actions.addWidget(self.btn_clear)
         root.addLayout(actions)
         
         self.duration_timer = QTimer()
@@ -2650,7 +2654,99 @@ class EnhancedTranscribeTab(QWidget):
         self.text_received.connect(self._handle_text_update)
         self.status_changed.connect(self._handle_status_update)
         self.error_occurred.connect(self._handle_error_update)
+    
+    def _summarize_transcription(self):
+        """Genera resumen de la transcripción actual"""
+        content = self.transcript_preview.toPlainText().strip()
         
+        if not content or content.startswith("🎤") or len(content) < 50:
+            QMessageBox.information(self, "Sin contenido", "No hay suficiente texto para resumir.")
+            return
+        
+        # Verificar que OpenAI esté configurado
+        if not self.ai.settings.openai_api_key:
+            QMessageBox.information(self, APP_NAME, 
+                                "El resumen IA está deshabilitado.\n"
+                                "Configura tu OpenAI API key en Ajustes.")
+            return
+        
+        # Limpiar contenido antes de resumir
+        clean_content = self._clean_content(content)
+        
+        if len(clean_content) < 50:
+            QMessageBox.information(self, "Contenido insuficiente", 
+                                "El texto es muy corto para generar un resumen útil.")
+            return
+        
+        # Confirmar acción
+        reply = QMessageBox.question(
+            self, "Generar resumen",
+            "¿Reemplazar la transcripción actual con un resumen ejecutivo?\n\n"
+            "Esta acción no se puede deshacer.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply != QMessageBox.Yes:
+            return
+        
+        # Mostrar indicador de progreso
+        self.btn_summarize.setText("Generando...")
+        self.btn_summarize.setEnabled(False)
+        self.status_label.setText("🤖 Generando resumen con IA...")
+        
+        # Usar QTimer para no bloquear UI
+        QTimer.singleShot(100, lambda: self._do_summarize(clean_content))
+
+    def _do_summarize(self, content: str):
+        """Ejecuta la generación del resumen"""
+        try:
+            # Generar resumen usando AIService
+            summary = self.ai.summarize_transcription(content)
+            
+            if summary and not summary.startswith("Error"):
+                # Reemplazar contenido con resumen
+                self.transcript_preview.clear()
+                self.transcript_preview.setPlainText(summary)
+                
+                # Actualizar título si está automático
+                if not self.title_edit.text().strip() or "Transcripción" in self.title_edit.text():
+                    current_time = datetime.now().strftime("%d/%m/%Y %H:%M")
+                    self.title_edit.setText(f"Resumen {current_time}")
+                
+                # Actualizar status
+                self.status_label.setText("✅ Resumen generado correctamente")
+                QTimer.singleShot(3000, lambda: self.status_label.setText("Listo"))
+                
+            else:
+                # Mostrar error
+                QMessageBox.warning(self, "Error", summary or "Error desconocido generando resumen")
+                self.status_label.setText("❌ Error en resumen")
+                QTimer.singleShot(3000, lambda: self.status_label.setText("Listo"))
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error generando resumen: {e}")
+            self.status_label.setText("❌ Error en resumen")
+            QTimer.singleShot(3000, lambda: self.status_label.setText("Listo"))
+        
+        finally:
+            # Restaurar estado del botón
+            self.btn_summarize.setText("📝 Resumen")
+            self._update_summarize_button_state()
+            
+    def _update_summarize_button_state(self):
+        """Actualiza el estado del botón de resumen"""
+        text = self.transcript_preview.toPlainText().strip()
+        clean_text = self._clean_content(text)
+        
+        # Habilitar si hay suficiente texto y NO se está transcribiendo
+        should_enable = (
+            len(clean_text) >= 50 and 
+            not self.is_transcribing and 
+            bool(self.ai.settings.openai_api_key)
+        )
+        
+        self.btn_summarize.setEnabled(should_enable)    
     def _test_speech_recognition(self):
         if not self._check_and_request_microphone_access():
             self.recognition_working = False
@@ -3388,6 +3484,9 @@ Después de habilitar los permisos, reinicia la aplicación.
         
         self.is_transcribing = False
         self.recognition_active = False
+        
+        # NUEVO: Actualizar estado del botón resumen
+        self._update_summarize_button_state()
 
     def _update_duration(self):
         if self.is_transcribing and self.start_time:
@@ -3451,6 +3550,9 @@ Después de habilitar los permisos, reinicia la aplicación.
         self.voice_profiles = []
         self.current_voice_features = None
         self.status_label.setText("Listo para transcribir" if self.recognition_working else "Configura micrófono para continuar")
+        
+        # NUEVO: Resetear estado del botón resumen
+        self.btn_summarize.setEnabled(False)
 
     def _save_as_note(self):
         content = self.transcript_preview.toPlainText().strip()
@@ -3489,10 +3591,13 @@ Después de habilitar los permisos, reinicia la aplicación.
                 except Exception as e:
                     print(f"Error indexando: {e}")
             
-            # NUEVO: Emitir señal para notificar a otras vistas
+            # Emitir señal para notificar a otras vistas
             self.note_saved.emit()
             
             QMessageBox.information(self, "Guardado", f"Transcripción guardada como '{title}'")
+            
+            # NUEVO: Limpiar automáticamente después de guardar exitosamente
+            self._clear_transcription()
             
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Error al guardar: {e}")
@@ -3522,6 +3627,9 @@ Para mejor captura:
         
         self.btn_save_note.setEnabled(has_content)
         self.btn_copy.setEnabled(has_content)
+        
+        # NUEVO: Actualizar botón de resumen
+        self._update_summarize_button_state()
         
 class SearchTab(QWidget):
     """Tab de búsqueda estilo Apple - CORREGIDO"""
